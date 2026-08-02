@@ -116,7 +116,7 @@ Clients
 **پاسخ:** Load balancer traffic ورودی را بین چند instance توزیع می‌کند تا از overload جلوگیری شود و availability بالا برود. L4 load balancing در سطح transport (TCP/UDP) کار می‌کند و فقط بر اساس IP و port تصمیم می‌گیرد، سریع‌تر است. L7 load balancing در سطح application (HTTP) کار می‌کند و می‌تواند بر اساس URL، header یا cookie routing کند، انعطاف بیشتری دارد اما overhead بیشتری هم دارد.
 
 **سوال:** یک URL shortener (مثل bit.ly) طراحی کنید. چه data store، hashing scheme و caching strategy استفاده می‌کنید؟
-**پاسخ:** برای تولید short code می‌توان از base62 encoding روی یک auto-increment ID یا از hashing (مثل MD5 با truncation و collision check) استفاده کرد. Data store می‌تواند یک key-value store مثل DynamoDB یا یک relational database با index روی short code باشد. برای caching، URL های پرترافیک در Redis نگه‌داری می‌شوند تا read latency کم شود. سیستم باید read-heavy design داشته باشد چون تعداد redirect بسیار بیشتر از تعداد create است.
+**پاسخ:** برای تولید short code می‌توان از base62 encoding روی یک auto-increment ID یا از hashing (مثل MD5 با truncation و collision check) استفاده کرد[^6]. Data store می‌تواند یک key-value store مثل DynamoDB یا یک relational database با index روی short code باشد. برای caching، URL های پرترافیک در Redis نگه‌داری می‌شوند تا read latency کم شود. سیستم باید read-heavy design داشته باشد چون تعداد redirect بسیار بیشتر از تعداد create است.
 
 ---
 
@@ -1996,3 +1996,67 @@ Trade-offها:
 	> _از Write Behind زمانی استفاده می‌کنم که سرعت نوشتن اهمیت زیادی داشته باشد و بتوانیم تأخیر در ثبت روی Database یا حتی از دست رفتن مقدار کمی از داده را بپذیریم؛ مانند شمارنده بازدید، لایک‌ها، متریک‌ها و داده‌های تحلیلی. برای داده‌های مالی یا تراکنش‌های بانکی از آن استفاده نمی‌کنم، چون پایداری و دوام داده (Durability) اولویت دارد._
 	
 	
+
+[^6]:                 Create Short URL
+	+--------+      +------------+      +------------------+
+	| Client | ---> | API Server | ---> | ID Generator     |
+	+--------+      +------------+      | (Auto Inc / UUID)|
+	                                     +--------+---------+
+	                                              |
+	                                              v
+	                                      Base62 Encoding
+	                                              |
+	                                              v
+	                                   Short Code: "aZ91Kx"
+	                                              |
+	                                              v
+	                     +-----------------------------------------+
+	                     | Database                               |
+	                     | shortCode -> Original Long URL         |
+	                     +-----------------------------------------+
+	
+	
+	                Redirect Request
+	+--------+      +------------+
+	| Client | ---> | API Server |
+	+--------+      +------------+
+	                      |
+	                      v
+	                +-----------+
+	                |  Redis    |  (Cache)
+	                +-----------+
+	                 |        |
+	          Cache Hit    Cache Miss
+	             |             |
+	             v             v
+	      Return URL      Query Database
+	             |             |
+	             +-------> Store in Redis
+	                           |
+	                           v
+	                   Return Original URL
+	                   
+	                   ### نکات مهم
+	
+	- **Hashing / Base62**
+	    - اگر از **Auto Increment ID** استفاده شود:
+	        
+	        ```
+	        1256789  → Base62 → "5Gt9"
+	        ```
+	        
+	        مزیت: هیچ Collision ندارد و تولید بسیار سریع است.
+	        
+	    - اگر از **Hash** (مثل MD5 یا SHA-256) استفاده شود:
+	        
+	        ```
+	        https://example.com/very/long/url
+	                      ↓ MD5
+	        9f86d081884...
+	                      ↓
+	                اولین 7 کاراکتر
+	                      ↓
+	                   a8F3kP2
+	        ```
+	        
+	        چون Hash را کوتاه می‌کنیم، ممکن است دو URL یک Short Code مشابه تولید کنند (**Collision**)، بنابراین قبل از ذخیره باید بررسی شود و در صورت نیاز دوباره تولید گردد.
