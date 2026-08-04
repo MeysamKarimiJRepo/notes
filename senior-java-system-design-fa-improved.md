@@ -126,7 +126,7 @@ Clients
 **پاسخ:** SQL برای داده‌های structured با relationship پیچیده و نیاز به strong consistency و ACID transaction مناسب است (مثل سیستم مالی). NoSQL برای scalability بالا، schema flexibility و مدل‌های داده‌ای مثل document، key-value، wide-column مناسب است (مثل MongoDB، Cassandra). NoSQL معمولاً eventual consistency[^7] را می‌پذیرد تا availability و partition tolerance بهتری داشته باشد.
 
 **سوال:** چطور schema و indexing strategy را برای یک سیستم high-write (مثل order management) با JDBC/JPA طراحی می‌کنید؟
-**پاسخ:** برای high-write باید تعداد index ها را محدود کرد چون هر index خودش write overhead دارد. از composite index بر اساس pattern query استفاده می‌شود، جداول با partitioning (مثل partition بر اساس تاریخ) تقسیم می‌شوند، و از batch insert در JPA (`hibernate.jdbc.batch_size`) برای کاهش round-trip استفاده می‌شود. همچنین می‌توان write را از طریق یک write-optimized table انجام داد و بعد async به read model sync کرد (CQRS).
+**پاسخ:** برای high-write باید تعداد index ها را محدود کرد چون هر index خودش write overhead دارد. از composite index بر اساس pattern query استفاده می‌شود، جداول با partitioning (مثل partition بر اساس تاریخ) تقسیم می‌شوند، و از batch insert در JPA (`hibernate.jdbc.batch_size`) برای کاهش round-trip استفاده می‌شود. همچنین می‌توان write را از طریق یک write-optimized table انجام داد و بعد async به read model sync کرد (CQRS)[^8].
 
 **سوال:** استراتژی‌های database sharding (range-based، hash-based، directory-based) را توضیح دهید. چطور با Java و connection pool مثل HikariCP این را پیاده می‌کنید؟
 **پاسخ:** Range-based sharding داده را بر اساس بازه یک key تقسیم می‌کند (ساده اما ممکن است hotspot ایجاد کند). Hash-based sharding از hash کلید برای توزیع یکنواخت استفاده می‌کند اما resharding سخت‌تر است. Directory-based از یک lookup service برای mapping key به shard استفاده می‌کند و انعطاف بیشتری دارد. در Java معمولاً با یک routing layer یا ShardingSphere و چند DataSource جداگانه (هرکدام با HikariCP pool خودش) این کار پیاده می‌شود.
@@ -2115,19 +2115,14 @@ Trade-offها:
 	
 	اگر سیستم مجبور باشد قبل از پاسخ دادن، منتظر بماند تا **همه Replicaها** آپدیت شوند:
 	
-	- سرعت نوشتن (Write) کاهش پیدا می‌کند.
-	    
-	- اگر یکی از سرورها از دسترس خارج باشد، ممکن است کل سیستم نتواند درخواست را پاسخ دهد.
-	    
+	* سرعت نوشتن (Write) کاهش پیدا می‌کند.
+	* اگر یکی از سرورها از دسترس خارج باشد، ممکن است کل سیستم نتواند درخواست را پاسخ دهد.
 	
 	در Eventual Consistency:
 	
 	1. درخواست Write سریع پذیرفته می‌شود.
-	    
 	2. پاسخ به کاربر برمی‌گردد.
-	    
 	3. سپس تغییرات در پس‌زمینه روی سایر Replicaها اعمال می‌شود.
-	    
 	
 	---
 	
@@ -2135,10 +2130,8 @@ Trade-offها:
 	
 	در سیستم‌های توزیع‌شده هنگام بروز Partition، معمولاً باید بین این دو یکی را انتخاب کنیم:
 	
-	- **Consistency (C)** → همیشه جدیدترین داده را ببینیم.
-	    
-	- **Availability (A)** → سیستم همیشه پاسخگو باشد.
-	    
+	* **Consistency (C)** → همیشه جدیدترین داده را ببینیم.
+	* **Availability (A)** → سیستم همیشه پاسخگو باشد.
 	
 	بسیاری از دیتابیس‌های NoSQL مانند **Cassandra** و **DynamoDB** در زمان Partition، **Availability** را ترجیح می‌دهند و بنابراین از **Eventual Consistency** استفاده می‌کنند.
 	
@@ -2163,43 +2156,839 @@ Trade-offها:
 	
 	✅ مناسب برای:
 	
-	- شبکه‌های اجتماعی
-	    
-	- تعداد لایک و بازدید
-	    
-	- URL Shortener
-	    
-	- DNS
-	    
-	- سیستم‌های لاگ
-	    
-	- کاتالوگ محصولات
-	    
+	* شبکه‌های اجتماعی
+	* تعداد لایک و بازدید
+	* URL Shortener
+	* DNS
+	* سیستم‌های لاگ
+	* کاتالوگ محصولات
 	
 	❌ مناسب نیست برای:
 	
-	- موجودی حساب بانکی
-	    
-	- انتقال پول
-	    
-	- خرید و فروش سهام
-	    
-	- موجودی انبار (در صورت حساس بودن به فروش بیش از موجودی)
-	    
+	* موجودی حساب بانکی
+	* انتقال پول
+	* خرید و فروش سهام
+	* موجودی انبار (در صورت حساس بودن به فروش بیش از موجودی)
 	
 	---
 	
 	## Strong Consistency در مقابل Eventual Consistency
 	
-	|Strong Consistency|Eventual Consistency|
-	|---|---|
-	|همیشه آخرین داده نمایش داده می‌شود.|ممکن است برای مدت کوتاهی داده قدیمی نمایش داده شود.|
-	|تأخیر بیشتر|تأخیر کمتر|
-	|Availability کمتر در زمان خطا|Availability بیشتر|
-	|مناسب بانک‌ها|مناسب شبکه‌های اجتماعی و سرویس‌های مقیاس‌پذیر|
+	| Strong Consistency                  | Eventual Consistency                                |
+	| ----------------------------------- | --------------------------------------------------- |
+	| همیشه آخرین داده نمایش داده می‌شود. | ممکن است برای مدت کوتاهی داده قدیمی نمایش داده شود. |
+	| تأخیر بیشتر                         | تأخیر کمتر                                          |
+	| Availability کمتر در زمان خطا       | Availability بیشتر                                  |
+	| مناسب بانک‌ها                       | مناسب شبکه‌های اجتماعی و سرویس‌های مقیاس‌پذیر       |
 	
 	---
 	
 	## پاسخ مناسب مصاحبه (حدود ۳۰ ثانیه)
 	
 	> **Eventual Consistency** یعنی بعد از ثبت یک تغییر، ممکن است همه Replicaها بلافاصله به‌روز نشوند و برخی کاربران برای مدت کوتاهی داده قدیمی را مشاهده کنند. اما اگر تغییر جدیدی روی آن داده انجام نشود، تمام Replicaها در نهایت به یک وضعیت یکسان می‌رسند. این مدل باعث افزایش **Availability**، **مقیاس‌پذیری** و **سرعت Write** در سیستم‌های توزیع‌شده می‌شود و به همین دلیل در دیتابیس‌هایی مانند Cassandra و DynamoDB به‌کار می‌رود.
+	
+
+[^8]: منظور جمله این است که **مدلی که برای ثبت اطلاعات استفاده می‌کنیم، الزاماً همان مدلی نیست که برای خواندن و جست‌وجو استفاده می‌کنیم.**
+	
+	این الگو را معمولاً **CQRS** می‌نامند:
+	
+	> **Command Query Responsibility Segregation**  
+	> جداسازی مسئولیت «نوشتن» از «خواندن»
+	
+	## تصویر کلی
+	
+	فرض کنید یک فروشگاه اینترنتی داریم:
+	
+	```text
+	                    ┌──────────────────┐
+	 POST /orders ────▶ │  Command Service │
+	                    │  ثبت سفارش       │
+	                    └────────┬─────────┘
+	                             │
+	                             ▼
+	                    ┌──────────────────┐
+	                    │ Write Database   │
+	                    │ orders           │
+	                    │ order_items      │
+	                    │ payments         │
+	                    └────────┬─────────┘
+	                             │
+	                      انتشار Event
+	                       OrderCreated
+	                             │
+	                             ▼
+	                    ┌──────────────────┐
+	                    │ Kafka / RabbitMQ │
+	                    └────────┬─────────┘
+	                             │ Async
+	                             ▼
+	                    ┌──────────────────┐
+	                    │ Read Model       │
+	                    │ Updater          │
+	                    └────────┬─────────┘
+	                             │
+	                             ▼
+	                    ┌────────────────────────┐
+	 GET /orders/123 ─▶ │ Read Database          │
+	                    │ order_details          │
+	                    │ آماده برای خواندن      │
+	                    └────────────────────────┘
+	```
+	
+	در این ساختار:
+	
+	- درخواست ایجاد یا تغییر سفارش وارد **Write Model** می‌شود.
+	    
+	- پس از ثبت موفق، یک Event مانند `OrderCreated` منتشر می‌شود.
+	    
+	- یک Consumer آن Event را به‌صورت asynchronous دریافت می‌کند.
+	    
+	- Consumer اطلاعات مناسب برای خواندن را در **Read Model** می‌سازد.
+	    
+	- درخواست‌های `GET` مستقیماً از Read Model پاسخ داده می‌شوند.
+	    
+	
+	---
+	
+	# چرا دو مدل جدا داریم؟
+	
+	مدل مناسب برای نوشتن معمولاً نرمال‌شده است:
+	
+	```text
+	orders
+	--------
+	id
+	customer_id
+	status
+	created_at
+	
+	order_items
+	-----------
+	id
+	order_id
+	product_id
+	quantity
+	unit_price
+	
+	customers
+	---------
+	id
+	name
+	email
+	
+	products
+	--------
+	id
+	name
+	price
+	```
+	
+	برای نمایش جزئیات سفارش باید چند جدول Join شوند:
+	
+	```sql
+	SELECT
+	    o.id,
+	    o.status,
+	    c.name,
+	    c.email,
+	    p.name,
+	    oi.quantity,
+	    oi.unit_price
+	FROM orders o
+	JOIN customers c ON c.id = o.customer_id
+	JOIN order_items oi ON oi.order_id = o.id
+	JOIN products p ON p.id = oi.product_id
+	WHERE o.id = 123;
+	```
+	
+	اگر این Query میلیون‌ها بار اجرا شود، ممکن است پرهزینه باشد.
+	
+	در Read Model می‌توان همان اطلاعات را از قبل آماده کرد:
+	
+	```text
+	order_details
+	------------------------------------------------
+	order_id
+	customer_name
+	customer_email
+	status
+	total_amount
+	items_json
+	created_at
+	```
+	
+	مثلاً:
+	
+	```json
+	{
+	  "orderId": 123,
+	  "customerName": "Meysam Karimi",
+	  "customerEmail": "meysam@example.com",
+	  "status": "CREATED",
+	  "totalAmount": 450000,
+	  "items": [
+	    {
+	      "productName": "Keyboard",
+	      "quantity": 1,
+	      "price": 300000
+	    },
+	    {
+	      "productName": "Mouse",
+	      "quantity": 1,
+	      "price": 150000
+	    }
+	  ]
+	}
+	```
+	
+	در نتیجه Query خواندن بسیار ساده می‌شود:
+	
+	```sql
+	SELECT *
+	FROM order_details
+	WHERE order_id = 123;
+	```
+	
+	یا Read Model حتی می‌تواند داخل Elasticsearch یا MongoDB باشد.
+	
+	---
+	
+	# منظور از Write-Optimized Table چیست؟
+	
+	جدول Write-optimized برای این طراحی می‌شود که:
+	
+	- Insert و Update سریع باشد.
+	    
+	- Constraintهای اصلی کسب‌وکار حفظ شوند.
+	    
+	- تراکنش‌ها قابل‌کنترل باشند.
+	    
+	- اطلاعات تکراری تا حد امکان کم باشد.
+	    
+	- عملیات نوشتن نیازی به Update کردن تعداد زیادی ستون و جدول نمایشی نداشته باشد.
+	    
+	
+	مثلاً برای تغییر وضعیت سفارش:
+	
+	```sql
+	UPDATE orders
+	SET status = 'PAID'
+	WHERE id = 123;
+	```
+	
+	اما در مدل خواندنی ممکن است اطلاعات تکراری داشته باشیم:
+	
+	```text
+	customer_order_list
+	----------------------------------------
+	order_id
+	customer_id
+	customer_name
+	status
+	total_amount
+	item_count
+	last_updated_at
+	```
+	
+	تکرار `customer_name` در Read Model اشکالی ندارد؛ چون هدف اصلی آن **سریع خواندن** است، نه جلوگیری کامل از تکرار داده.
+	
+	---
+	
+	# نمونه پیاده‌سازی با Spring Boot و Kafka
+	
+	## ۱. دریافت Command
+	
+	```java
+	public record CreateOrderCommand(
+	        Long customerId,
+	        List<CreateOrderItem> items
+	) {
+	}
+	
+	public record CreateOrderItem(
+	        Long productId,
+	        int quantity
+	) {
+	}
+	```
+	
+	Controller:
+	
+	```java
+	@RestController
+	@RequestMapping("/orders")
+	@RequiredArgsConstructor
+	public class OrderCommandController {
+	
+	    private final OrderCommandService orderCommandService;
+	
+	    @PostMapping
+	    public ResponseEntity<CreateOrderResponse> createOrder(
+	            @RequestBody CreateOrderCommand command
+	    ) {
+	        Long orderId = orderCommandService.create(command);
+	
+	        return ResponseEntity
+	                .accepted()
+	                .body(new CreateOrderResponse(orderId));
+	    }
+	}
+	```
+	
+	---
+	
+	## ۲. ذخیره در Write Model
+	
+	```java
+	@Service
+	@RequiredArgsConstructor
+	public class OrderCommandService {
+	
+	    private final OrderRepository orderRepository;
+	    private final KafkaTemplate<String, OrderCreatedEvent> kafkaTemplate;
+	
+	    @Transactional
+	    public Long create(CreateOrderCommand command) {
+	        Order order = new Order();
+	        order.setCustomerId(command.customerId());
+	        order.setStatus(OrderStatus.CREATED);
+	        order.setCreatedAt(Instant.now());
+	
+	        for (CreateOrderItem item : command.items()) {
+	            order.addItem(
+	                    item.productId(),
+	                    item.quantity()
+	            );
+	        }
+	
+	        Order savedOrder = orderRepository.save(order);
+	
+	        OrderCreatedEvent event =
+	                OrderCreatedEvent.from(savedOrder);
+	
+	        kafkaTemplate.send(
+	                "order-created",
+	                savedOrder.getId().toString(),
+	                event
+	        );
+	
+	        return savedOrder.getId();
+	    }
+	}
+	```
+	
+	Event:
+	
+	```java
+	public record OrderCreatedEvent(
+	        Long orderId,
+	        Long customerId,
+	        String status,
+	        Instant createdAt,
+	        List<OrderItemEvent> items
+	) {
+	    public static OrderCreatedEvent from(Order order) {
+	        List<OrderItemEvent> items = order.getItems()
+	                .stream()
+	                .map(item -> new OrderItemEvent(
+	                        item.getProductId(),
+	                        item.getQuantity(),
+	                        item.getUnitPrice()
+	                ))
+	                .toList();
+	
+	        return new OrderCreatedEvent(
+	                order.getId(),
+	                order.getCustomerId(),
+	                order.getStatus().name(),
+	                order.getCreatedAt(),
+	                items
+	        );
+	    }
+	}
+	```
+	
+	---
+	
+	## ۳. همگام‌سازی Async با Read Model
+	
+	```java
+	@Component
+	@RequiredArgsConstructor
+	public class OrderReadModelConsumer {
+	
+	    private final OrderReadRepository orderReadRepository;
+	    private final CustomerRepository customerRepository;
+	    private final ProductRepository productRepository;
+	
+	    @KafkaListener(
+	            topics = "order-created",
+	            groupId = "order-read-model"
+	    )
+	    public void handle(OrderCreatedEvent event) {
+	
+	        Customer customer = customerRepository
+	                .findById(event.customerId())
+	                .orElseThrow();
+	
+	        List<OrderReadItem> items = event.items()
+	                .stream()
+	                .map(item -> {
+	                    Product product = productRepository
+	                            .findById(item.productId())
+	                            .orElseThrow();
+	
+	                    return new OrderReadItem(
+	                            product.getName(),
+	                            item.quantity(),
+	                            item.unitPrice()
+	                    );
+	                })
+	                .toList();
+	
+	        BigDecimal totalAmount = items.stream()
+	                .map(item -> item.unitPrice()
+	                        .multiply(BigDecimal.valueOf(item.quantity())))
+	                .reduce(BigDecimal.ZERO, BigDecimal::add);
+	
+	        OrderReadModel readModel = new OrderReadModel(
+	                event.orderId(),
+	                customer.getName(),
+	                customer.getEmail(),
+	                event.status(),
+	                totalAmount,
+	                items,
+	                event.createdAt()
+	        );
+	
+	        orderReadRepository.save(readModel);
+	    }
+	}
+	```
+	
+	این Consumer می‌تواند اطلاعات را در MongoDB ذخیره کند:
+	
+	```java
+	@Document("order_details")
+	public record OrderReadModel(
+	        @Id Long orderId,
+	        String customerName,
+	        String customerEmail,
+	        String status,
+	        BigDecimal totalAmount,
+	        List<OrderReadItem> items,
+	        Instant createdAt
+	) {
+	}
+	```
+	
+	---
+	
+	## ۴. خواندن از Read Model
+	
+	```java
+	@RestController
+	@RequestMapping("/orders")
+	@RequiredArgsConstructor
+	public class OrderQueryController {
+	
+	    private final OrderReadRepository orderReadRepository;
+	
+	    @GetMapping("/{orderId}")
+	    public ResponseEntity<OrderReadModel> getOrder(
+	            @PathVariable Long orderId
+	    ) {
+	        return orderReadRepository
+	                .findById(orderId)
+	                .map(ResponseEntity::ok)
+	                .orElseGet(() -> ResponseEntity.notFound().build());
+	    }
+	}
+	```
+	
+	در اینجا درخواست `GET` دیگر به جداول اصلی `orders` و `order_items` مراجعه نمی‌کند.
+	
+	---
+	
+	# جریان زمانی درخواست
+	
+	```text
+	زمان T1
+	کاربر سفارش ایجاد می‌کند.
+	
+	POST /orders
+	       │
+	       ▼
+	Write DB:
+	Order 123 = CREATED
+	       │
+	       ▼
+	پاسخ:
+	202 Accepted
+	orderId = 123
+	```
+	
+	کمی بعد:
+	
+	```text
+	زمان T2
+	Kafka Event مصرف می‌شود.
+	
+	OrderCreated
+	      │
+	      ▼
+	Read Model ساخته می‌شود.
+	
+	order_details:
+	Order 123 = CREATED
+	```
+	
+	در فاصله بین `T1` و `T2` ممکن است این اتفاق بیفتد:
+	
+	```text
+	POST /orders       → موفق
+	GET /orders/123    → هنوز پیدا نشد
+	```
+	
+	چون Read Model هنوز Update نشده است.
+	
+	چند میلی‌ثانیه یا چند ثانیه بعد:
+	
+	```text
+	GET /orders/123    → سفارش برگردانده می‌شود
+	```
+	
+	این رفتار را **Eventual Consistency** می‌نامیم.
+	
+	---
+	
+	# مشکل مهم: گم‌شدن Event
+	
+	کد زیر ریسک دارد:
+	
+	```java
+	orderRepository.save(order);
+	kafkaTemplate.send("order-created", event);
+	```
+	
+	ممکن است:
+	
+	1. سفارش در دیتابیس ثبت شود.
+	    
+	2. برنامه قبل از ارسال Event کرش کند.
+	    
+	3. Read Model هرگز از سفارش جدید مطلع نشود.
+	    
+	
+	```text
+	Write DB               Kafka
+	   │                     │
+	   │ Order saved         │
+	   │                     │
+	   └── Application crash X
+	                         │
+	                    Event not sent
+	```
+	
+	راه‌حل رایج، **Transactional Outbox Pattern** است.
+	
+	---
+	
+	# CQRS همراه با Outbox
+	
+	در همان Transaction، هم سفارش و هم Event در دیتابیس ذخیره می‌شوند:
+	
+	```text
+	┌──────────────── Database Transaction ────────────────┐
+	│                                                     │
+	│  INSERT INTO orders ...                             │
+	│                                                     │
+	│  INSERT INTO outbox_events                          │
+	│      (event_type, aggregate_id, payload)             │
+	│                                                     │
+	└────────────────── Commit ────────────────────────────┘
+	```
+	
+	سپس یک Worker رکوردهای Outbox را به Kafka ارسال می‌کند:
+	
+	```text
+	Write Database
+	 ├── orders
+	 └── outbox_events
+	          │
+	          ▼
+	    Outbox Publisher
+	          │
+	          ▼
+	         Kafka
+	          │
+	          ▼
+	      Read Model
+	```
+	
+	نمونه ساده:
+	
+	```java
+	@Transactional
+	public Long create(CreateOrderCommand command) {
+	    Order order = buildOrder(command);
+	    orderRepository.save(order);
+	
+	    OrderCreatedEvent event = OrderCreatedEvent.from(order);
+	
+	    OutboxEvent outboxEvent = new OutboxEvent(
+	            UUID.randomUUID(),
+	            "Order",
+	            order.getId().toString(),
+	            "OrderCreated",
+	            serialize(event),
+	            Instant.now(),
+	            OutboxStatus.PENDING
+	    );
+	
+	    outboxRepository.save(outboxEvent);
+	
+	    return order.getId();
+	}
+	```
+	
+	Publisher:
+	
+	```java
+	@Scheduled(fixedDelay = 1000)
+	public void publishPendingEvents() {
+	    List<OutboxEvent> events =
+	            outboxRepository.findPendingEvents();
+	
+	    for (OutboxEvent event : events) {
+	        try {
+	            kafkaTemplate.send(
+	                    event.getEventType(),
+	                    event.getAggregateId(),
+	                    event.getPayload()
+	            ).get();
+	
+	            event.markAsPublished();
+	            outboxRepository.save(event);
+	
+	        } catch (Exception exception) {
+	            event.increaseRetryCount();
+	            outboxRepository.save(event);
+	        }
+	    }
+	}
+	```
+	
+	---
+	
+	# Consumer باید Idempotent باشد
+	
+	ممکن است یک Event بیشتر از یک بار دریافت شود:
+	
+	```text
+	OrderCreated Event
+	       │
+	       ├────▶ Consumer اجرا شد
+	       │
+	       └────▶ همان Event دوباره ارسال شد
+	```
+	
+	اگر Consumer بدون کنترل دو بار Insert کند، داده تکراری ایجاد می‌شود.
+	
+	برای جلوگیری، `eventId` را ذخیره می‌کنیم:
+	
+	```java
+	@Transactional
+	@KafkaListener(topics = "order-created")
+	public void handle(OrderCreatedEvent event) {
+	
+	    if (processedEventRepository.existsById(event.eventId())) {
+	        return;
+	    }
+	
+	    updateReadModel(event);
+	
+	    processedEventRepository.save(
+	            new ProcessedEvent(
+	                    event.eventId(),
+	                    Instant.now()
+	            )
+	    );
+	}
+	```
+	
+	یا از Upsert استفاده می‌کنیم:
+	
+	```sql
+	INSERT INTO order_details (
+	    order_id,
+	    status,
+	    total_amount
+	)
+	VALUES (
+	    123,
+	    'CREATED',
+	    450000
+	)
+	ON CONFLICT (order_id)
+	DO UPDATE SET
+	    status = EXCLUDED.status,
+	    total_amount = EXCLUDED.total_amount;
+	```
+	
+	---
+	
+	# آیا همیشه دو دیتابیس لازم است؟
+	
+	خیر. سه حالت متداول داریم.
+	
+	### حالت ساده: یک دیتابیس و دو جدول
+	
+	```text
+	PostgreSQL
+	 ├── orders             ← Write Model
+	 ├── order_items        ← Write Model
+	 └── order_details      ← Read Model
+	```
+	
+	### حالت متوسط: یک نوع دیتابیس، دو Instance
+	
+	```text
+	PostgreSQL Write DB
+	        │
+	        ▼
+	      Kafka
+	        │
+	        ▼
+	PostgreSQL Read DB
+	```
+	
+	### حالت پیشرفته: دیتابیس متفاوت برای هر نیاز
+	
+	```text
+	Write Model: PostgreSQL
+	       │
+	       ▼
+	     Kafka
+	       │
+	       ├──▶ Elasticsearch  برای جست‌وجو
+	       ├──▶ Redis          برای پاسخ سریع
+	       └──▶ MongoDB        برای Document View
+	```
+	
+	مثلاً:
+	
+	```text
+	ثبت سفارش و تراکنش مالی  → PostgreSQL
+	جست‌وجوی سفارش‌ها         → Elasticsearch
+	نمایش سفارش پرتکرار       → Redis
+	```
+	
+	---
+	
+	# چه زمانی CQRS مناسب است؟
+	
+	CQRS زمانی مفید است که:
+	
+	- تعداد Read بسیار بیشتر از Write باشد.
+	    
+	- Queryها Join و محاسبات سنگین داشته باشند.
+	    
+	- شکل داده برای Write و Read بسیار متفاوت باشد.
+	    
+	- سیستم Event-driven باشد.
+	    
+	- بتوانیم کمی تأخیر در نمایش داده را تحمل کنیم.
+	    
+	- Read Modelهای مختلفی برای کاربردهای مختلف نیاز داشته باشیم.
+	    
+	
+	برای مثال:
+	
+	```text
+	یک سفارش ثبت می‌شود
+	       │
+	       ├──▶ Read Model صفحه جزئیات سفارش
+	       ├──▶ Read Model پنل مدیریتی
+	       ├──▶ Read Model گزارش مالی
+	       ├──▶ Elasticsearch برای جست‌وجو
+	       └──▶ Notification Service
+	```
+	
+	---
+	
+	# چه زمانی CQRS انتخاب خوبی نیست؟
+	
+	برای یک سیستم CRUD ساده، CQRS ممکن است پیچیدگی غیرضروری ایجاد کند:
+	
+	```text
+	بدون CQRS:
+	
+	Controller
+	   │
+	Service
+	   │
+	PostgreSQL
+	```
+	
+	در مقابل:
+	
+	```text
+	با CQRS:
+	
+	Command API
+	Write Model
+	Outbox
+	Message Broker
+	Consumer
+	Read Model
+	Retry
+	DLQ
+	Idempotency
+	Monitoring
+	Reconciliation
+	```
+	
+	بنابراین هزینه‌هایی مانند این‌ها اضافه می‌شوند:
+	
+	- Eventual consistency
+	    
+	- مدیریت Eventهای تکراری
+	    
+	- Retry و DLQ
+	    
+	- ترتیب Eventها
+	    
+	- بازسازی Read Model
+	    
+	- مانیتورینگ Lag
+	    
+	- Versioning رویدادها
+	    
+	
+	---
+	
+	## خلاصه بسیار ساده
+	
+	```text
+	بدون CQRS:
+	
+	Write ──▶ Database ◀── Read
+	```
+	
+	```text
+	با CQRS:
+	
+	Write ──▶ Write Model
+	              │
+	              │ Event
+	              ▼
+	         Message Broker
+	              │
+	              ▼
+	Read  ◀── Read Model
+	```
+	
+	یعنی:
+	
+	> اطلاعات را در ساختاری ثبت می‌کنیم که برای صحت تراکنش و Write مناسب است؛ سپس به‌صورت asynchronous نسخه‌ای از آن را در ساختاری قرار می‌دهیم که برای Query و نمایش سریع بهینه شده است.
