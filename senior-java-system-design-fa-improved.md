@@ -68,7 +68,7 @@ Clients
 برای هر component بپرسید: «اگر این بخش down/slow شود چه می‌شود؟» سپس timeout، retry، circuit breaker، [^1]DLQ، replication، idempotency، [^2]graceful degradation و [^4]recovery را توضیح دهید.
 
 ### مرحله ۶ — Production readiness
-پاسخ Senior باید metrics، logs، tracing، alerting، deployment، security، capacity planning و rollback را نیز پوشش دهد.
+پاسخ Senior باید metrics، logs، tracing، alerting، [^9]deployment، security، capacity planning و rollback را نیز پوشش دهد.
 
 ---
 
@@ -2992,3 +2992,5 @@ Trade-offها:
 	یعنی:
 	
 	> اطلاعات را در ساختاری ثبت می‌کنیم که برای صحت تراکنش و Write مناسب است؛ سپس به‌صورت asynchronous نسخه‌ای از آن را در ساختاری قرار می‌دهیم که برای Query و نمایش سریع بهینه شده است.
+
+[^9]: 
