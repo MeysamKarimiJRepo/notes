@@ -4083,4 +4083,816 @@ Trade-offها:
 	              Kafka
 	```
 	
-	یک نکته مهم دیگر هم اینجا وجود دارد: **Outbox معمولاً تضمین exactly-once end-to-end به تو نمی‌دهد و ممکن است یک Event دوبار deliver شود.** بنابراین Consumer باید `idempotent` طراحی شود. این هم یکی از سؤال‌های بسیار رایج بعدی در مصاحبه‌های Senior Backend است.
+	یک نکته مهم دیگر هم اینجا وجود دارد: **Outbox معمولاً تضمین exactly-once end-to-end به تو نمی‌دهد و ممکن است یک Event دوبار deliver شود.** بنابراین Consumer باید `idempotent` طراحی شود[^12]. این هم یکی از سؤال‌های بسیار رایج بعدی در مصاحبه‌های Senior Backend است.
+
+[^12]: حتماً. منظور از این جمله که:
+	
+	**Consumer باید `idempotent` باشد**
+	
+	این است که اگر یک Event به هر دلیلی **دو یا چند بار** به Consumer رسید، نتیجه نهایی فقط **یک بار** اعمال شود.
+	
+	مثلاً دوبار رسیدن `PaymentCompleted` نباید باعث شود موجودی انبار دوبار کم شود.
+	
+	---
+	
+	## اول ببینیم چرا Event ممکن است دوبار ارسال شود
+	
+	در مثال قبلی داشتیم:
+	
+	```text
+	Order Service
+	     │
+	     ▼
+	Outbox Table
+	     │
+	     ▼
+	Publisher
+	     │
+	     ▼
+	Kafka
+	```
+	
+	فرض کن Outbox این Event را دارد:
+	
+	```text
+	event_id = 123
+	event_type = OrderCreated
+	published = false
+	```
+	
+	Publisher آن را می‌خواند:
+	
+	```text
+	Publisher
+	    │
+	    ▼
+	Kafka.send(event 123)
+	```
+	
+	Kafka با موفقیت Event را دریافت می‌کند:
+	
+	```text
+	Kafka ✅
+	```
+	
+	اما قبل از اینکه Publisher این مقدار را در DB تغییر دهد:
+	
+	```text
+	published = true
+	```
+	
+	برنامه Crash می‌کند:
+	
+	```text
+	Kafka send ✅
+	
+	      ↓
+	
+	Application Crash 💥
+	
+	      ↓
+	
+	published هنوز false است
+	```
+	
+	وقتی برنامه دوباره بالا بیاید:
+	
+	```text
+	Outbox:
+	
+	event_id = 123
+	published = false
+	```
+	
+	Publisher فکر می‌کند Event هنوز ارسال نشده است:
+	
+	```text
+	Publisher
+	    │
+	    ▼
+	Kafka.send(event 123)
+	```
+	
+	بنابراین Kafka ممکن است همان Event را دوباره ببیند:
+	
+	```text
+	Kafka
+	
+	OrderCreated(eventId=123)
+	OrderCreated(eventId=123)
+	```
+	
+	این نوع رفتار در معماری‌های distributed کاملاً طبیعی است.
+	
+	---
+	
+	# مشکل در Consumer
+	
+	فرض کنیم `Inventory Service` Consumer است.
+	
+	Event:
+	
+	```text
+	OrderPaid
+	
+	orderId = 100
+	productId = 500
+	quantity = 2
+	```
+	
+	Consumer ساده:
+	
+	```java
+	@KafkaListener(topics = "payment-events")
+	@Transactional
+	public void handle(PaymentCompletedEvent event) {
+	
+	    Inventory inventory =
+	        inventoryRepository.findByProductId(event.productId())
+	            .orElseThrow();
+	
+	    inventory.setQuantity(
+	        inventory.getQuantity() - event.quantity()
+	    );
+	}
+	```
+	
+	در ابتدا:
+	
+	```text
+	Product 500
+	
+	quantity = 10
+	```
+	
+	Event بار اول می‌رسد:
+	
+	```text
+	PaymentCompleted
+	quantity = 2
+	
+	       ↓
+	
+	Inventory:
+	
+	10 - 2 = 8 ✅
+	```
+	
+	اما اگر همان Event دوباره برسد:
+	
+	```text
+	PaymentCompleted
+	quantity = 2
+	
+	       ↓
+	
+	Inventory:
+	
+	8 - 2 = 6 ❌
+	```
+	
+	در حالی که باید فقط یک بار موجودی کم می‌شد.
+	
+	نتیجه صحیح باید:
+	
+	```text
+	quantity = 8
+	```
+	
+	باشد، نه:
+	
+	```text
+	quantity = 6
+	```
+	
+	---
+	
+	# اینجاست که Idempotency وارد می‌شود
+	
+	Idempotent یعنی:
+	
+	```text
+	یک Event را:
+	
+	1 بار اجرا کنیم  → نتیجه X
+	2 بار اجرا کنیم  → باز هم نتیجه X
+	10 بار اجرا کنیم → باز هم نتیجه X
+	```
+	
+	مثلاً:
+	
+	```text
+	Event 123
+	    │
+	    ▼
+	First delivery
+	    │
+	    ▼
+	Process ✅
+	
+	
+	Event 123
+	    │
+	    ▼
+	Second delivery
+	    │
+	    ▼
+	Already processed
+	    │
+	    ▼
+	Ignore ✅
+	```
+	
+	---
+	
+	# چطور بفهمیم Event قبلاً پردازش شده؟
+	
+	معمولاً هر Event یک ID منحصر به فرد دارد.
+	
+	مثلاً:
+	
+	```json
+	{
+	  "eventId": "evt-123",
+	  "eventType": "PaymentCompleted",
+	  "orderId": 100,
+	  "productId": 500,
+	  "quantity": 2
+	}
+	```
+	
+	در Consumer یک جدول نگه می‌داریم:
+	
+	```text
+	processed_events
+	```
+	
+	مثلاً:
+	
+	```text
+	+-----------+---------------------+
+	| event_id  | processed_at        |
+	+-----------+---------------------+
+	| evt-123   | 2026-08-28 21:00    |
+	+-----------+---------------------+
+	```
+	
+	وقتی Event می‌رسد:
+	
+	```text
+	PaymentCompleted
+	eventId = evt-123
+	```
+	
+	Consumer اول بررسی می‌کند:
+	
+	```text
+	آیا evt-123 قبلاً پردازش شده؟
+	
+	        │
+	    ┌───┴────┐
+	    │        │
+	   NO       YES
+	    │        │
+	    ▼        ▼
+	Process    Ignore
+	```
+	
+	---
+	
+	# پیاده‌سازی با Spring Boot
+	
+	Entity:
+	
+	```java
+	@Entity
+	@Table(name = "processed_events")
+	@Getter
+	@Setter
+	public class ProcessedEvent {
+	
+	    @Id
+	    private String eventId;
+	
+	    private LocalDateTime processedAt;
+	}
+	```
+	
+	Repository:
+	
+	```java
+	public interface ProcessedEventRepository
+	        extends JpaRepository<ProcessedEvent, String> {
+	}
+	```
+	
+	حالا Consumer:
+	
+	```java
+	@Service
+	@RequiredArgsConstructor
+	public class PaymentEventConsumer {
+	
+	    private final InventoryRepository inventoryRepository;
+	    private final ProcessedEventRepository processedEventRepository;
+	
+	    @KafkaListener(topics = "payment-events")
+	    @Transactional
+	    public void handle(PaymentCompletedEvent event) {
+	
+	        if (processedEventRepository.existsById(event.eventId())) {
+	            return;
+	        }
+	
+	        Inventory inventory =
+	            inventoryRepository
+	                .findByProductId(event.productId())
+	                .orElseThrow();
+	
+	        inventory.setQuantity(
+	            inventory.getQuantity() - event.quantity()
+	        );
+	
+	        ProcessedEvent processedEvent = new ProcessedEvent();
+	
+	        processedEvent.setEventId(event.eventId());
+	        processedEvent.setProcessedAt(LocalDateTime.now());
+	
+	        processedEventRepository.save(processedEvent);
+	    }
+	}
+	```
+	
+	جریان این کد:
+	
+	```text
+	Kafka Event
+	eventId = evt-123
+	      │
+	      ▼
+	Consumer
+	      │
+	      ▼
+	existsById("evt-123")?
+	      │
+	      ├── YES → return
+	      │
+	      └── NO
+	           │
+	           ▼
+	     update inventory
+	           │
+	           ▼
+	     save evt-123
+	           │
+	           ▼
+	         COMMIT
+	```
+	
+	---
+	
+	# نکته خیلی مهم: هر دو عملیات باید در یک Transaction باشند
+	
+	این قسمت خیلی مهم است.
+	
+	ما می‌خواهیم این دو عملیات:
+	
+	```text
+	1. Inventory update
+	2. Mark event as processed
+	```
+	
+	در یک transaction باشند.
+	
+	به همین دلیل:
+	
+	```java
+	@Transactional
+	```
+	
+	داریم.
+	
+	یعنی:
+	
+	```text
+	BEGIN TRANSACTION
+	
+	    UPDATE inventory
+	
+	    INSERT processed_events
+	
+	COMMIT
+	```
+	
+	شکل:
+	
+	```text
+	          Local Transaction
+	┌─────────────────────────────────┐
+	│                                 │
+	│ UPDATE inventory                │
+	│ quantity = quantity - 2         │
+	│                                 │
+	│ INSERT processed_events         │
+	│ event_id = evt-123              │
+	│                                 │
+	└────────────────┬────────────────┘
+	                 │
+	               COMMIT
+	```
+	
+	اگر وسط کار Crash کنیم:
+	
+	```text
+	UPDATE inventory ✅
+	
+	       ↓
+	
+	CRASH 💥
+	
+	       ↓
+	
+	INSERT processed_events انجام نشد
+	```
+	
+	چون transaction هنوز Commit نشده:
+	
+	```text
+	ROLLBACK
+	```
+	
+	بنابراین Inventory هم به حالت قبل برمی‌گردد.
+	
+	---
+	
+	# بار اول Event
+	
+	فرض کنیم:
+	
+	```text
+	Inventory = 10
+	
+	processed_events = empty
+	```
+	
+	Event:
+	
+	```text
+	evt-123
+	quantity = 2
+	```
+	
+	Consumer:
+	
+	```text
+	evt-123 exists?
+	       │
+	       └── NO
+	            │
+	            ▼
+	Inventory: 10 → 8
+	            │
+	            ▼
+	INSERT evt-123
+	            │
+	            ▼
+	COMMIT
+	```
+	
+	نتیجه:
+	
+	```text
+	Inventory = 8
+	
+	processed_events:
+	
+	evt-123
+	```
+	
+	---
+	
+	# بار دوم همان Event
+	
+	Kafka دوباره می‌فرستد:
+	
+	```text
+	evt-123
+	```
+	
+	Consumer:
+	
+	```text
+	evt-123 exists?
+	       │
+	       └── YES ✅
+	            │
+	            ▼
+	          Ignore
+	```
+	
+	Inventory:
+	
+	```text
+	8
+	```
+	
+	می‌ماند.
+	
+	بنابراین:
+	
+	```text
+	First event:
+	
+	10 → 8
+	
+	
+	Duplicate event:
+	
+	8 → 8
+	```
+	
+	این یعنی Consumer ما `idempotent` شده است.
+	
+	---
+	
+	# اما یک مشکل ظریف‌تر داریم
+	
+	کد زیر:
+	
+	```java
+	if (processedEventRepository.existsById(event.eventId())) {
+	    return;
+	}
+	```
+	
+	در شرایط concurrency ممکن است مشکل داشته باشد.
+	
+	فرض کن دو Consumer تقریباً همزمان یک Event را بگیرند:
+	
+	```text
+	Consumer A              Consumer B
+	
+	exists(evt-123)?
+	NO                      
+	
+	                        exists(evt-123)?
+	                        NO
+	
+	process                  process
+	```
+	
+	هر دو فکر می‌کنند Event جدید است.
+	
+	بنابراین روش مطمئن‌تر این است که روی `event_id` یک Unique Constraint داشته باشیم.
+	
+	در مثال ما چون:
+	
+	```java
+	@Id
+	private String eventId;
+	```
+	
+	وجود دارد، Event ID خودش unique است.
+	
+	می‌توانیم ابتدا Event را ثبت کنیم.
+	
+	مثلاً:
+	
+	```java
+	@Transactional
+	public void handle(PaymentCompletedEvent event) {
+	
+	    ProcessedEvent processedEvent = new ProcessedEvent();
+	    processedEvent.setEventId(event.eventId());
+	    processedEvent.setProcessedAt(LocalDateTime.now());
+	
+	    try {
+	        processedEventRepository.saveAndFlush(processedEvent);
+	    } catch (DataIntegrityViolationException ex) {
+	
+	        // Duplicate event
+	        return;
+	    }
+	
+	    Inventory inventory =
+	        inventoryRepository
+	            .findByProductId(event.productId())
+	            .orElseThrow();
+	
+	    inventory.setQuantity(
+	        inventory.getQuantity() - event.quantity()
+	    );
+	}
+	```
+	
+	Conceptually:
+	
+	```text
+	Event evt-123
+	      │
+	      ▼
+	INSERT processed_events(evt-123)
+	      │
+	      ├── Success
+	      │      │
+	      │      ▼
+	      │   Process business logic
+	      │
+	      └── Duplicate Key
+	             │
+	             ▼
+	          Ignore
+	```
+	
+	این روش در برابر concurrent processing هم مطمئن‌تر است.
+	
+	---
+	
+	# یک روش دیگر: Idempotency با Business Key
+	
+	همیشه لازم نیست جدول `processed_events` داشته باشیم.
+	
+	گاهی خود مدل business به ما اجازه می‌دهد عملیات را idempotent کنیم.
+	
+	مثلاً Payment Service قرار است Order را Paid کند.
+	
+	روش خطرناک:
+	
+	```java
+	payment.setAmount(
+	    payment.getAmount() + event.amount()
+	);
+	```
+	
+	اگر Event دوبار بیاید:
+	
+	```text
+	100 + 100 = 200 ❌
+	```
+	
+	اما اگر مدل ما این باشد:
+	
+	```java
+	payment.setStatus(PaymentStatus.PAID);
+	```
+	
+	بار اول:
+	
+	```text
+	PENDING → PAID
+	```
+	
+	بار دوم:
+	
+	```text
+	PAID → PAID
+	```
+	
+	نتیجه تغییر نمی‌کند.
+	
+	یعنی operation ذاتاً idempotent است.
+	
+	---
+	
+	# یک مثال خیلی واضح
+	
+	این عملیات idempotent نیست:
+	
+	```text
+	balance = balance - 100
+	```
+	
+	اگر دوبار اجرا شود:
+	
+	```text
+	1000
+	 ↓
+	900
+	 ↓
+	800 ❌
+	```
+	
+	اما این operation می‌تواند idempotent شود:
+	
+	```text
+	Payment ID = pay-789
+	
+	اگر pay-789 قبلاً اعمال نشده:
+	    subtract 100
+	else:
+	    do nothing
+	```
+	
+	نتیجه:
+	
+	```text
+	First:
+	
+	1000 → 900
+	
+	
+	Duplicate:
+	
+	900 → 900
+	```
+	
+	---
+	
+	# ارتباط کامل Saga + Outbox + Idempotent Consumer
+	
+	حالا این سه مفهوم کنار هم قرار می‌گیرند:
+	
+	```text
+	Order Service
+	     │
+	     │ @Transactional
+	     ▼
+	
+	┌───────────────────────┐
+	│ orders                │
+	│ outbox_events         │
+	└──────────┬────────────┘
+	           │
+	           │
+	           ▼
+	      Outbox Publisher
+	           │
+	           ▼
+	         Kafka
+	           │
+	           │
+	           │ Event may be
+	           │ delivered twice
+	           ▼
+	
+	     Payment Service
+	           │
+	           ▼
+	
+	   Idempotent Consumer
+	           │
+	           ▼
+	
+	event already processed?
+	      │
+	   ┌──┴───┐
+	   │      │
+	  YES    NO
+	   │      │
+	Ignore  Process
+	          │
+	          ▼
+	       Payment DB
+	```
+	
+	در واقع:
+	
+	```text
+	Transactional Outbox
+	
+	حل می‌کند:
+	
+	DB updated شد ولی Event گم نشود.
+	
+	
+	Idempotent Consumer
+	
+	حل می‌کند:
+	
+	اگر Event دوبار رسید،
+	business operation دوبار اجرا نشود.
+	```
+	
+	---
+	
+	## جمله خوب برای مصاحبه
+	
+	می‌توانی بگویی:
+	
+	> **Because outbox-based messaging usually provides at-least-once delivery, the same event may be delivered more than once. Therefore, consumers should be idempotent. A common solution is to assign each event a unique event ID and store processed IDs in the consumer's database within the same local transaction as the business update. Duplicate events can then safely be ignored.**
+	
+	این زنجیره را برای مصاحبه حفظ کن:
+	
+	```text
+	Saga
+	  │
+	  ▼
+	Local Transactions
+	  │
+	  ▼
+	Transactional Outbox
+	  │
+	  ▼
+	Kafka
+	  │
+	  ▼
+	At-least-once delivery
+	  │
+	  ▼
+	Possible duplicates
+	  │
+	  ▼
+	Idempotent Consumer
+	```
+	
+	این دقیقاً یکی از مهم‌ترین زنجیره‌های مفهومی در طراحی Microserviceهای واقعی است.
