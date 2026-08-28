@@ -141,7 +141,7 @@ Clients
 **پاسخ:** Optimistic locking فرض می‌کند conflict نادر است؛ با یک ستون `@Version` تغییرات هم‌زمان تشخیص داده می‌شوند و در صورت conflict یک `OptimisticLockException` پرتاب می‌شود. Pessimistic locking از ابتدا رکورد را با `SELECT ... FOR UPDATE` قفل می‌کند تا هیچ transaction دیگری نتواند آن را تغییر دهد، مناسب برای high-contention scenario ها اما throughput را کاهش می‌دهد.
 
 **سوال:** یک distributed transaction بین چند microservice با database های جداگانه طراحی کنید (Saga pattern در مقابل 2PC).
-**پاسخ:** Two-Phase Commit (2PC) یک consistency قوی می‌دهد اما blocking است و در microservice های مقیاس بزرگ scalability کمی دارد. Saga pattern یک sequence از local transaction هاست که هرکدام یک event منتشر می‌کنند؛ در صورت شکست، compensating transaction ها اجرا می‌شوند (choreography-based با Kafka یا orchestration-based با یک saga orchestrator). Saga معمولاً برای microservices ترجیح داده می‌شود چون loosely-coupled و scalable است.
+**پاسخ:** Two-Phase Commit (2PC) یک consistency قوی می‌دهد اما blocking است و در microservice های مقیاس بزرگ scalability کمی دارد. Saga pattern یک sequence از local transaction هاست که هرکدام یک event منتشر می‌کنند؛ در صورت شکست، compensating transaction ها اجرا می‌شوند (choreography-based با Kafka یا orchestration-based با یک saga orchestrator). Saga معمولاً برای microservices ترجیح داده می‌شود چون loosely-coupled و scalable است.[^10]
 
 ---
 
@@ -2994,3 +2994,550 @@ Trade-offها:
 	> اطلاعات را در ساختاری ثبت می‌کنیم که برای صحت تراکنش و Write مناسب است؛ سپس به‌صورت asynchronous نسخه‌ای از آن را در ساختاری قرار می‌دهیم که برای Query و نمایش سریع بهینه شده است.
 
 [^9]: 
+
+[^10]: حتماً. بهترین راه فهمش این است که یک مثال واقعی بزنیم.
+	
+	فرض کن در یک فروشگاه اینترنتی برای ثبت سفارش، سه Microservice داریم و **هرکدام دیتابیس مستقل خودشان را دارند**:
+	
+	```text
+	Order Service          Payment Service        Inventory Service
+	     │                        │                       │
+	     ▼                        ▼                       ▼
+	 Order DB                 Payment DB              Stock DB
+	```
+	
+	وقتی کاربر سفارش می‌دهد، باید هر سه کار انجام شوند:
+	
+	```text
+	1. Order ساخته شود
+	2. پول پرداخت شود
+	3. موجودی کالا کم شود
+	```
+	
+	مشکل اینجاست که اگر مرحله 1 و 2 موفق شوند ولی مرحله 3 شکست بخورد چه کنیم؟
+	
+	```text
+	Create Order ✅
+	     │
+	     ▼
+	Payment ✅
+	     │
+	     ▼
+	Reserve Stock ❌
+	
+	حالا چه؟
+	پول گرفته شده ولی کالا موجود نیست!
+	```
+	
+	اینجاست که **Distributed Transaction** مطرح می‌شود.
+	
+	## روش اول: 2PC — Two Phase Commit
+	
+	در 2PC یک Coordinator مرکزی داریم که به همه Databaseها می‌گوید:
+	
+	> فعلاً تغییرات را آماده کنید، ولی هنوز Commit نکنید.
+	
+	شکل ساده:
+	
+	```text
+	                  Transaction Coordinator
+	                         │
+	          ┌──────────────┼──────────────┐
+	          ▼              ▼              ▼
+	      Order DB       Payment DB      Stock DB
+	```
+	
+	### Phase 1: Prepare
+	
+	Coordinator از همه می‌پرسد:
+	
+	```text
+	Coordinator
+	    │
+	    ├──► Order DB     : Can you commit?
+	    │                  ◄── YES
+	    │
+	    ├──► Payment DB   : Can you commit?
+	    │                  ◄── YES
+	    │
+	    └──► Stock DB     : Can you commit?
+	                       ◄── YES
+	```
+	
+	در این مرحله transactionها هنوز کامل Commit نشده‌اند و ممکن است resource/lock نگه داشته شود.
+	
+	اگر همه بگویند YES:
+	
+	### Phase 2: Commit
+	
+	```text
+	Coordinator
+	    │
+	    ├──► Order DB       COMMIT ✅
+	    ├──► Payment DB     COMMIT ✅
+	    └──► Stock DB       COMMIT ✅
+	```
+	
+	ولی اگر یکی بگوید NO:
+	
+	```text
+	Order DB       → YES
+	Payment DB     → YES
+	Stock DB       → NO ❌
+	
+	              Coordinator
+	                   │
+	                   ▼
+	             ROLLBACK ALL
+	```
+	
+	یعنی:
+	
+	```text
+	Order    ❌ rollback
+	Payment  ❌ rollback
+	Stock    ❌ rollback
+	```
+	
+	مزیت 2PC این است که از دید تراکنش، **همه با هم موفق می‌شوند یا همه با هم rollback می‌شوند**.
+	
+	اما مشکل اصلی این است که سرویس‌ها باید منتظر یکدیگر بمانند:
+	
+	```text
+	Service A
+	   │
+	   │ WAIT...
+	   │
+	Service B
+	   │
+	   │ WAIT...
+	   │
+	Service C
+	```
+	
+	اگر Coordinator یا یکی از Participantها دچار مشکل شود، transaction ممکن است مدت بیشتری در وضعیت نامشخص/منتظر باقی بماند و lock یا resource درگیر شود.
+	
+	پس در Microserviceهای بزرگ معمولاً این وابستگی مطلوب نیست.
+	
+	---
+	
+	# روش دوم: Saga Pattern
+	
+	Saga یک ایده متفاوت دارد:
+	
+	> به جای اینکه یک Transaction بزرگ داشته باشیم، چند **Local Transaction** مستقل داریم.
+	
+	مثلاً:
+	
+	```text
+	Order Service
+	    │
+	    ▼
+	Create Order
+	Order DB COMMIT ✅
+	    │
+	    ▼
+	OrderCreated Event
+	    │
+	    ▼
+	Payment Service
+	    │
+	    ▼
+	Take Payment
+	Payment DB COMMIT ✅
+	    │
+	    ▼
+	PaymentCompleted Event
+	    │
+	    ▼
+	Inventory Service
+	    │
+	    ▼
+	Reserve Stock
+	Stock DB COMMIT ✅
+	```
+	
+	نکته مهم این است که وقتی `Order Service` کارش را Commit کرد، دیگر transaction دیتابیس آن باز نمی‌ماند.
+	
+	```text
+	Order DB
+	BEGIN
+	INSERT...
+	COMMIT ✅
+	
+	تمام شد.
+	```
+	
+	بعد Payment Service transaction خودش را دارد:
+	
+	```text
+	Payment DB
+	BEGIN
+	PAY...
+	COMMIT ✅
+	```
+	
+	بنابراین:
+	
+	```text
+	یک Transaction بزرگ نداریم.
+	
+	بلکه:
+	
+	Transaction 1 ✅
+	      ↓
+	Transaction 2 ✅
+	      ↓
+	Transaction 3 ✅
+	```
+	
+	حالا سؤال مهم:
+	
+	**اگر Transaction سوم Fail شود چه؟**
+	
+	مثلاً:
+	
+	```text
+	Create Order ✅
+	      │
+	      ▼
+	Take Payment ✅
+	      │
+	      ▼
+	Reserve Stock ❌
+	```
+	
+	Saga می‌گوید transactionهای قبلی را DB-level rollback نمی‌کنیم؛ چون قبلاً Commit شده‌اند.
+	
+	در عوض عملیات جبرانی یا **Compensating Transaction** انجام می‌دهیم.
+	
+	مثلاً:
+	
+	```text
+	Reserve Stock ❌
+	      │
+	      ▼
+	Refund Payment
+	      │
+	      ▼
+	Cancel Order
+	```
+	
+	در نتیجه:
+	
+	```text
+	Create Order ✅
+	Take Payment ✅
+	Reserve Stock ❌
+	
+	       ↓ compensation
+	
+	Refund Payment ✅
+	Cancel Order ✅
+	```
+	
+	پس جریان کامل می‌تواند چیزی شبیه این باشد:
+	
+	```text
+	NORMAL FLOW
+	===========
+	
+	[Create Order]
+	      │
+	      ▼
+	[Take Payment]
+	      │
+	      ▼
+	[Reserve Stock]
+	      │
+	      ▼
+	[Ship Order]
+	
+	        ✅ Success
+	
+	
+	FAILURE FLOW
+	============
+	
+	[Create Order] ✅
+	      │
+	      ▼
+	[Take Payment] ✅
+	      │
+	      ▼
+	[Reserve Stock] ❌
+	      │
+	      ▼
+	[Refund Payment]
+	      │
+	      ▼
+	[Cancel Order]
+	```
+	
+	این بخش، قلب Saga است:
+	
+	```text
+	Transaction             Compensation
+	-----------             ------------
+	
+	Create Order      <-->  Cancel Order
+	
+	Take Payment      <-->  Refund Payment
+	
+	Reserve Stock     <-->  Release Stock
+	
+	Create Shipment   <-->  Cancel Shipment
+	```
+	
+	---
+	
+	# دو نوع Saga داریم
+	
+	## 1. Choreography
+	
+	در این حالت Coordinator مرکزی نداریم.
+	
+	هر سرویس Event منتشر می‌کند و سرویس بعدی آن Event را می‌شنود.
+	
+	مثلاً با Kafka:
+	
+	```text
+	                  Kafka
+	
+	Order Service
+	     │
+	     │ OrderCreated
+	     ▼
+	   Kafka
+	     │
+	     ▼
+	Payment Service
+	     │
+	     │ PaymentCompleted
+	     ▼
+	   Kafka
+	     │
+	     ▼
+	Inventory Service
+	     │
+	     │ StockReserved
+	     ▼
+	   Kafka
+	     │
+	     ▼
+	Shipping Service
+	```
+	
+	هر سرویس فقط می‌داند:
+	
+	> وقتی فلان event آمد، من کار خودم را انجام می‌دهم.
+	
+	مثلاً:
+	
+	```text
+	OrderCreated
+	     │
+	     ▼
+	Payment Service
+	
+	PaymentCompleted
+	     │
+	     ▼
+	Inventory Service
+	
+	StockReserved
+	     │
+	     ▼
+	Shipping Service
+	```
+	
+	اگر Inventory شکست بخورد:
+	
+	```text
+	Inventory Service
+	      │
+	      │ StockReservationFailed
+	      ▼
+	    Kafka
+	      │
+	      ▼
+	Payment Service
+	      │
+	      ▼
+	Refund()
+	```
+	
+	مزیت:
+	
+	```text
+	Loosely coupled
+	Scalable
+	No central coordinator
+	```
+	
+	اما اگر Saga خیلی بزرگ شود، دنبال کردن جریان Events ممکن است سخت شود:
+	
+	```text
+	Service A ──event──► Service B
+	    ▲                    │
+	    │                    event
+	 event                   ▼
+	Service D ◄──event── Service C
+	
+	          😵
+	```
+	
+	گاهی به این پیچیدگی اصطلاحاً **event spaghetti** می‌گویند.
+	
+	---
+	
+	# 2. Orchestration
+	
+	اینجا یک سرویس مخصوص داریم:
+	
+	```text
+	             Saga Orchestrator
+	                    │
+	          ┌─────────┼─────────┐
+	          ▼         ▼         ▼
+	       Order      Payment   Inventory
+	       Service    Service    Service
+	```
+	
+	Orchestrator تصمیم می‌گیرد قدم بعدی چیست.
+	
+	مثلاً:
+	
+	```text
+	Saga Orchestrator
+	       │
+	       ├──► Order Service
+	       │        Create Order ✅
+	       │
+	       ├──► Payment Service
+	       │        Pay ✅
+	       │
+	       ├──► Inventory Service
+	       │        Reserve ❌
+	       │
+	       ├──► Payment Service
+	       │        Refund ✅
+	       │
+	       └──► Order Service
+	                Cancel ✅
+	```
+	
+	یعنی منطق Workflow در یک جا مشخص است:
+	
+	```text
+	START
+	  │
+	  ▼
+	Create Order
+	  │
+	  ▼
+	Payment
+	  │
+	  ├── failure ──► Cancel Order
+	  │
+	  ▼
+	Reserve Stock
+	  │
+	  ├── failure ──► Refund ──► Cancel Order
+	  │
+	  ▼
+	Shipping
+	  │
+	  ▼
+	DONE
+	```
+	
+	این روش معمولاً برای Sagaهای پیچیده قابل فهم‌تر است.
+	
+	---
+	
+	# تفاوت اصلی Saga و 2PC
+	
+	به این شکل به خاطر بسپار:
+	
+	### 2PC
+	
+	```text
+	        ONE BIG TRANSACTION
+	
+	        ┌─────────────────────────────┐
+	        │                             │
+	Order DB → Payment DB → Inventory DB
+	        │                             │
+	        └──── COMMIT / ROLLBACK ──────┘
+	
+	همه باید با هم تصمیم بگیرند.
+	```
+	
+	### Saga
+	
+	```text
+	        MULTIPLE SMALL TRANSACTIONS
+	
+	Order Tx ✅
+	    │
+	    ▼
+	Payment Tx ✅
+	    │
+	    ▼
+	Inventory Tx ❌
+	    │
+	    ▼
+	Compensate
+	    │
+	    ├── Refund Payment
+	    └── Cancel Order
+	```
+	
+	مقایسه خلاصه:
+	
+	|ویژگی|2PC|Saga|
+	|---|---|---|
+	|Transaction|یک distributed transaction|چند local transaction|
+	|Consistency|قوی‌تر / atomic commit|معمولاً eventual consistency|
+	|Lock/Resource holding|ممکن است طولانی‌تر باشد|هر local transaction سریع Commit می‌شود|
+	|Coupling|بیشتر|کمتر|
+	|Scalability|معمولاً ضعیف‌تر|بهتر|
+	|Failure handling|Rollback|Compensation|
+	|Microservices|کمتر رایج|بسیار رایج|
+	|Kafka|الزامی نیست|در Choreography رایج است|
+	
+	### جمله‌ای که برای مصاحبه خیلی خوب است
+	
+	**2PC می‌گوید:**
+	
+	```text
+	یا همه را همین الان Commit کن،
+	یا هیچ‌کدام را Commit نکن.
+	```
+	
+	**Saga می‌گوید:**
+	
+	```text
+	هر مرحله را جداگانه Commit کن.
+	
+	اگر بعداً مشکلی پیش آمد،
+	اثرات مراحل قبلی را با
+	Compensating Transactions
+	خنثی کن.
+	```
+	
+	و مهم‌ترین نکته مفهومی Saga این است که **Compensation الزاماً همان Database Rollback نیست**. مثلاً اگر پول واقعاً از کارت مشتری گرفته شده باشد، دیگر `ROLLBACK` دیتابیس معنی ندارد؛ باید یک عملیات تجاری جدید یعنی `Refund` انجام دهیم.
+	
+	```text
+	Payment = $100 ✅
+	       ↓
+	Stock failed ❌
+	       ↓
+	Refund $100 ✅
+	
+	Refund یک Transaction جدید است،
+	نه rollback تراکنش قبلی.
+	```
+	
+	برای مصاحبه‌های Senior Java/Microservices، بعد از این مفهوم معمولاً سؤال مهم بعدی **Transactional Outbox Pattern** است؛ چون مصاحبه‌گر می‌پرسد: «اگر DB commit شد ولی قبل از publish کردن Kafka event سرویس crash کرد چه؟» که دقیقاً یکی از مشکلات مهم پیاده‌سازی Saga است.
