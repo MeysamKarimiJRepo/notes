@@ -3540,4 +3540,547 @@ Trade-offها:
 	نه rollback تراکنش قبلی.
 	```
 	
-	برای مصاحبه‌های Senior Java/Microservices، بعد از این مفهوم معمولاً سؤال مهم بعدی **Transactional Outbox Pattern** است؛ چون مصاحبه‌گر می‌پرسد: «اگر DB commit شد ولی قبل از publish کردن Kafka event سرویس crash کرد چه؟» که دقیقاً یکی از مشکلات مهم پیاده‌سازی Saga است.
+	برای مصاحبه‌های Senior Java/Microservices، بعد از این مفهوم معمولاً سؤال مهم بعدی **Transactional Outbox Pattern** [^11]است؛ چون مصاحبه‌گر می‌پرسد: «اگر DB commit شد ولی قبل از publish کردن Kafka event سرویس crash کرد چه؟» که دقیقاً یکی از مشکلات مهم پیاده‌سازی Saga است.
+	منظورم این است که در Saga، هر Microservice فقط transaction مربوط به **دیتابیس خودش** را باز می‌کند و همان‌جا Commit می‌کند؛ transaction باز نمی‌ماند تا سرویس‌های بعدی هم کارشان تمام شود.
+
+
+[^11]: Transactional Outbox Pattern برای حل این مشکل است:
+	
+	فرض کن در یک Microservice هم باید دیتابیس را تغییر بدهی، هم یک Event به Kafka بفرستی.
+	
+	```text
+	Order Service
+	    │
+	    ├──► Order DB
+	    │
+	    └──► Kafka
+	```
+	
+	مشکل اینجاست که این دو کار در یک transaction مشترک نیستند.
+	
+	مثلاً:
+	
+	```text
+	1. Order در DB ذخیره شد ✅
+	2. برنامه Crash کرد 💥
+	3. Event به Kafka نرفت ❌
+	```
+	
+	در نتیجه:
+	
+	```text
+	Order DB:
+	
+	order_id=100
+	status=CREATED     ✅
+	
+	Kafka:
+	
+	OrderCreated event ❌
+	```
+	
+	پس Payment Service اصلاً متوجه ایجاد سفارش نمی‌شود.
+	
+	Transactional Outbox می‌گوید:
+	
+	> Event را مستقیماً به Kafka نفرست. اول خود Event را داخل همان Database و داخل همان transaction ذخیره کن.
+	
+	مثلاً دو جدول داریم:
+	
+	```text
+	Order Database
+	│
+	├── orders
+	│
+	└── outbox_events
+	```
+	
+	وقتی Order ساخته می‌شود:
+	
+	```text
+	BEGIN TRANSACTION
+	
+	INSERT INTO orders ...
+	
+	INSERT INTO outbox_events ...
+	
+	COMMIT
+	```
+	
+	یعنی:
+	
+	```text
+	       یک Local Transaction
+	┌──────────────────────────────┐
+	│                              │
+	│  INSERT orders               │
+	│         +                    │
+	│  INSERT outbox_events        │
+	│                              │
+	└──────────────┬───────────────┘
+	               │
+	             COMMIT
+	               │
+	               ▼
+	              ✅
+	```
+	
+	یا هر دو موفق می‌شوند:
+	
+	```text
+	Order saved ✅
+	Event saved ✅
+	```
+	
+	یا هر دو rollback می‌شوند:
+	
+	```text
+	Order saved ❌
+	Event saved ❌
+	```
+	
+	این همان تضمینی است که می‌خواهیم.
+	
+	---
+	
+	### با Spring Boot
+	
+	مثلاً Entity مربوط به Outbox:
+	
+	```java
+	@Entity
+	@Table(name = "outbox_events")
+	@Getter
+	@Setter
+	public class OutboxEvent {
+	
+	    @Id
+	    @GeneratedValue(strategy = GenerationType.IDENTITY)
+	    private Long id;
+	
+	    private String aggregateType;
+	
+	    private Long aggregateId;
+	
+	    private String eventType;
+	
+	    @Column(columnDefinition = "TEXT")
+	    private String payload;
+	
+	    private LocalDateTime createdAt;
+	
+	    private boolean published;
+	}
+	```
+	
+	و Service:
+	
+	```java
+	@Service
+	@RequiredArgsConstructor
+	public class OrderService {
+	
+	    private final OrderRepository orderRepository;
+	    private final OutboxEventRepository outboxRepository;
+	    private final ObjectMapper objectMapper;
+	
+	    @Transactional
+	    public Long createOrder(CreateOrderRequest request)
+	            throws JsonProcessingException {
+	
+	        Order order = new Order();
+	        order.setCustomerId(request.customerId());
+	        order.setAmount(request.amount());
+	        order.setStatus(OrderStatus.CREATED);
+	
+	        orderRepository.save(order);
+	
+	        OrderCreatedEvent event =
+	            new OrderCreatedEvent(
+	                order.getId(),
+	                request.customerId(),
+	                request.amount()
+	            );
+	
+	        OutboxEvent outbox = new OutboxEvent();
+	
+	        outbox.setAggregateType("Order");
+	        outbox.setAggregateId(order.getId());
+	        outbox.setEventType("OrderCreated");
+	        outbox.setPayload(
+	            objectMapper.writeValueAsString(event)
+	        );
+	        outbox.setCreatedAt(LocalDateTime.now());
+	        outbox.setPublished(false);
+	
+	        outboxRepository.save(outbox);
+	
+	        return order.getId();
+	    }
+	}
+	```
+	
+	نکته مهم همین `@Transactional` است:
+	
+	```text
+	@Transactional
+	createOrder()
+	
+	     │
+	     ├── save Order
+	     │
+	     └── save OutboxEvent
+	
+	             │
+	             ▼
+	          COMMIT
+	```
+	
+	چون `orders` و `outbox_events` داخل یک Database هستند، Spring می‌تواند هر دو را در یک transaction واقعی انجام دهد.
+	
+	---
+	
+	بعد یک process جداگانه Eventهای Outbox را برمی‌دارد و به Kafka ارسال می‌کند.
+	
+	مثلاً ساده‌ترین روش:
+	
+	```java
+	@Service
+	@RequiredArgsConstructor
+	public class OutboxPublisher {
+	
+	    private final OutboxEventRepository outboxRepository;
+	    private final KafkaTemplate<String, String> kafkaTemplate;
+	
+	    @Scheduled(fixedDelay = 1000)
+	    public void publishEvents() {
+	
+	        List<OutboxEvent> events =
+	            outboxRepository.findByPublishedFalse();
+	
+	        for (OutboxEvent event : events) {
+	
+	            kafkaTemplate.send(
+	                "order-events",
+	                event.getAggregateId().toString(),
+	                event.getPayload()
+	            );
+	
+	            event.setPublished(true);
+	
+	            outboxRepository.save(event);
+	        }
+	    }
+	}
+	```
+	
+	جریان:
+	
+	```text
+	Order Service
+	     │
+	     ▼
+	┌──────────────────────┐
+	│ Order DB             │
+	│                      │
+	│ orders               │
+	│ outbox_events        │
+	└──────────┬───────────┘
+	           │
+	           │ polling
+	           ▼
+	    Outbox Publisher
+	           │
+	           ▼
+	         Kafka
+	           │
+	           ▼
+	    Payment Service
+	```
+	
+	مثلاً بعد از createOrder دیتابیس این شکلی است:
+	
+	```text
+	orders
+	+-----+----------+
+	| id  | status   |
+	+-----+----------+
+	| 100 | CREATED  |
+	+-----+----------+
+	
+	
+	outbox_events
+	+----+---------+--------------+-----------+
+	| id | agg_id  | event_type   | published |
+	+----+---------+--------------+-----------+
+	| 51 | 100     | OrderCreated | false     |
+	+----+---------+--------------+-----------+
+	```
+	
+	Publisher بعداً Event را می‌فرستد:
+	
+	```text
+	outbox_events
+	     │
+	     │ OrderCreated
+	     ▼
+	Kafka
+	     │
+	     ▼
+	Payment Service
+	```
+	
+	بعد:
+	
+	```text
+	published = true
+	```
+	
+	---
+	
+	### اگر سرویس بعد از Commit کردن Crash کند چه؟
+	
+	این حالت را ببین:
+	
+	```text
+	@Transactional
+	
+	INSERT Order       ✅
+	
+	INSERT OutboxEvent ✅
+	
+	COMMIT             ✅
+	
+	        │
+	        ▼
+	
+	     CRASH 💥
+	```
+	
+	مشکلی نیست.
+	
+	چون Event هنوز داخل DB است:
+	
+	```text
+	outbox_events
+	
+	OrderCreated
+	published=false
+	```
+	
+	وقتی برنامه دوباره بالا بیاید:
+	
+	```text
+	Publisher
+	    │
+	    ▼
+	find unpublished events
+	    │
+	    ▼
+	Kafka
+	```
+	
+	پس Event گم نمی‌شود.
+	
+	---
+	
+	### مشکل اصلی بدون Outbox
+	
+	این کد خطرناک است:
+	
+	```java
+	@Transactional
+	public void createOrder(...) {
+	
+	    orderRepository.save(order);
+	
+	    kafkaTemplate.send(
+	        "order-events",
+	        event
+	    );
+	}
+	```
+	
+	چون دو سیستم مختلف داریم:
+	
+	```text
+	PostgreSQL
+	    +
+	Kafka
+	```
+	
+	ممکن است:
+	
+	```text
+	DB COMMIT ✅
+	Kafka send ❌
+	```
+	
+	یا حالت‌های پیچیده دیگری رخ دهد.
+	
+	Transactional Outbox این را تبدیل می‌کند به:
+	
+	```text
+	PostgreSQL Transaction:
+	
+	Order
+	  +
+	Event
+	
+	COMMIT ✅
+	```
+	
+	و ارسال Kafka بعداً انجام می‌شود.
+	
+	---
+	
+	### در سیستم واقعی معمولاً دو روش Publish داریم
+	
+	روش ساده Polling است:
+	
+	```text
+	outbox table
+	     │
+	     │ SELECT every 1 sec
+	     ▼
+	Publisher
+	     │
+	     ▼
+	Kafka
+	```
+	
+	مثلاً با:
+	
+	```java
+	@Scheduled
+	```
+	
+	ولی در سیستم‌های بزرگ‌تر معمولاً از **CDC — Change Data Capture** استفاده می‌کنند.
+	
+	یکی از ابزارهای معروف:
+	
+	```text
+	Debezium
+	```
+	
+	معماری:
+	
+	```text
+	Order Service
+	     │
+	     ▼
+	PostgreSQL
+	│
+	├── orders
+	│
+	└── outbox_events
+	       │
+	       │ DB transaction log
+	       ▼
+	    Debezium
+	       │
+	       ▼
+	      Kafka
+	       │
+	       ▼
+	Payment Service
+	```
+	
+	یعنی Debezium تغییرات جدول Outbox را از WAL / transaction log دیتابیس می‌خواند و به Kafka می‌فرستد.
+	
+	مزیتش این است که دیگر لازم نیست دائماً:
+	
+	```sql
+	SELECT *
+	FROM outbox_events
+	WHERE published = false;
+	```
+	
+	اجرا کنیم.
+	
+	---
+	
+	### ارتباطش با Saga
+	
+	حالا Saga ما خیلی مطمئن‌تر می‌شود:
+	
+	```text
+	Order Service
+	      │
+	      │ Transaction
+	      ▼
+	
+	Order DB
+	┌────────────────────────┐
+	│ Order = CREATED        │
+	│ Outbox = OrderCreated  │
+	└────────────┬───────────┘
+	             │
+	           COMMIT
+	             │
+	             ▼
+	         Debezium
+	             │
+	             ▼
+	           Kafka
+	             │
+	             ▼
+	      Payment Service
+	             │
+	             │ Transaction
+	             ▼
+	
+	Payment DB
+	┌─────────────────────────────┐
+	│ Payment = PAID              │
+	│ Outbox = PaymentCompleted   │
+	└─────────────┬───────────────┘
+	              │
+	            COMMIT
+	              │
+	              ▼
+	            Kafka
+	              │
+	              ▼
+	      Inventory Service
+	```
+	
+	هر Microservice عملاً همین Pattern را تکرار می‌کند.
+	
+	### جمله مناسب برای مصاحبه
+	
+	می‌توانی این‌طور بگویی:
+	
+	> **Transactional Outbox ensures atomicity between a local database change and event creation by storing both business data and the event in the same database transaction. A separate publisher or CDC mechanism such as Debezium then publishes the outbox event to Kafka.**
+	
+	و از نظر ذهنی فقط این شکل را حفظ کن:
+	
+	```text
+	            ❌ Bad
+	
+	Database ────── Kafka
+	    │             │
+	 COMMIT         publish
+	    │             │
+	    └── atomic نیستند
+	
+	
+	            ✅ Outbox
+	
+	       PostgreSQL Transaction
+	     ┌───────────────────────┐
+	     │ Business Data         │
+	     │        +              │
+	     │ Outbox Event          │
+	     └──────────┬────────────┘
+	                │
+	              COMMIT
+	                │
+	                ▼
+	         Publisher/Debezium
+	                │
+	                ▼
+	              Kafka
+	```
+	
+	یک نکته مهم دیگر هم اینجا وجود دارد: **Outbox معمولاً تضمین exactly-once end-to-end به تو نمی‌دهد و ممکن است یک Event دوبار deliver شود.** بنابراین Consumer باید `idempotent` طراحی شود. این هم یکی از سؤال‌های بسیار رایج بعدی در مصاحبه‌های Senior Backend است.
