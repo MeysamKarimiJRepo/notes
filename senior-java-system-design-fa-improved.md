@@ -160,7 +160,7 @@ Clients
 **پاسخ:** با استفاده از تکنیک‌هایی مثل lock/mutex (فقط یک thread اجازه دارد cache را از database پر کند و بقیه منتظر بمانند)، probabilistic early expiration، یا stale-while-revalidate (سرو کردن داده قدیمی هنگام refresh در پس‌زمینه).[^13]
 
 **سوال:** چطور distributed cache را با source-of-truth database consistent نگه می‌دارید؟
-**پاسخ:** با TTL مناسب برای expire خودکار، invalidation event ها (مثلاً از طریق Kafka وقتی رکورد database تغییر می‌کند) و write-through pattern. برای consistency قوی‌تر می‌توان از event-driven cache invalidation یا Change Data Capture (CDC) با ابزارهایی مثل Debezium استفاده کرد.
+**پاسخ:** با TTL مناسب برای expire خودکار، invalidation event ها (مثلاً از طریق Kafka وقتی رکورد database تغییر می‌کند) و write-through pattern. برای consistency قوی‌تر می‌توان از event-driven cache invalidation یا Change Data Capture (CDC) با ابزارهایی مثل Debezium استفاده کرد.[^14]
 
 ---
 
@@ -5466,3 +5466,591 @@ Trade-offها:
 	```
 	
 	تا همه با هم expire نشوند.
+
+[^14]: بله. مسئله اصلی این است که ما دو نسخه از یک داده داریم:
+	
+	```text
+	Database              Cache
+	---------             --------
+	User #10              User #10
+	name = Ali            name = Ali
+	```
+	
+	Database معمولاً **source of truth** است، یعنی نسخه اصلی و معتبر داده آنجاست.
+	
+	حالا فرض کن نام کاربر در DB تغییر کند:
+	
+	```text
+	Database              Cache
+	---------             --------
+	name = Reza           name = Ali   ❌
+	```
+	
+	اینجا cache دیگر با DB consistent نیست.
+	
+	به این وضعیت می‌گوییم:
+	
+	```text
+	stale cache
+	```
+	
+	حالا روش‌های پاسخ را یکی‌یکی ببینیم.
+	
+	### 1. TTL — ساده‌ترین راه
+	
+	برای cache زمان انقضا تعیین می‌کنیم:
+	
+	```text
+	key = user:10
+	value = {name: Ali}
+	TTL = 5 minutes
+	```
+	
+	اگر DB تغییر کند:
+	
+	```text
+	Database
+	name = Reza
+	
+	Cache
+	name = Ali
+	```
+	
+	ممکن است تا حداکثر 5 دقیقه مقدار قدیمی را بدهیم.
+	
+	بعد از TTL:
+	
+	```text
+	Cache expired
+	      |
+	      v
+	Cache MISS
+	      |
+	      v
+	Database
+	name = Reza
+	      |
+	      v
+	Cache = Reza
+	```
+	
+	پس TTL تضمین نمی‌کند cache همیشه دقیق باشد؛ فقط تضمین می‌کند داده قدیمی **برای همیشه باقی نماند**.
+	
+	---
+	
+	## 2. Cache invalidation
+	
+	راه بهتر این است که وقتی DB تغییر کرد، cache همان موقع حذف شود.
+	
+	فرض کن داریم:
+	
+	```text
+	PUT /users/10
+	name = Reza
+	```
+	
+	Application:
+	
+	```text
+	        Application
+	          /     \
+	         v       v
+	       DB       Cache
+	```
+	
+	اول DB را update می‌کنیم:
+	
+	```text
+	DB
+	Ali ---> Reza
+	```
+	
+	بعد cache را invalidate می‌کنیم:
+	
+	```text
+	DEL user:10
+	```
+	
+	حالا:
+	
+	```text
+	Database              Redis
+	---------             -----
+	name = Reza           user:10 = NOT FOUND
+	```
+	
+	درخواست بعدی:
+	
+	```text
+	Request
+	   |
+	   v
+	Redis
+	   |
+	 MISS
+	   |
+	   v
+	Database
+	   |
+	 Reza
+	   |
+	   v
+	Redis
+	```
+	
+	در نتیجه cache دوباره با مقدار جدید پر می‌شود.
+	
+	این الگو در عمل خیلی رایج است:
+	
+	```text
+	UPDATE DB
+	   |
+	   v
+	DELETE CACHE
+	```
+	
+	---
+	
+	## 3. Event-driven invalidation با Kafka
+	
+	در distributed system ممکن است چند application یا microservice داشته باشیم:
+	
+	```text
+	                 +--> Service A
+	                 |
+	Database --------+--> Service B
+	                 |
+	                 +--> Service C
+	```
+	
+	و هرکدام cache داشته باشند:
+	
+	```text
+	Service A --> Redis/cache
+	Service B --> Redis/cache
+	Service C --> Redis/cache
+	```
+	
+	اگر User Service اطلاعات user را تغییر دهد، چطور بقیه بفهمند؟
+	
+	اینجا Kafka مفید است.
+	
+	مثلاً:
+	
+	```text
+	User Service
+	     |
+	     | UPDATE
+	     v
+	 Database
+	     |
+	     |
+	     +----> Kafka
+	            UserUpdated
+	            userId=10
+	```
+	
+	بقیه سرویس‌ها event را consume می‌کنند:
+	
+	```text
+	                    Kafka
+	                      |
+	          +-----------+-----------+
+	          |           |           |
+	          v           v           v
+	      Service A   Service B   Service C
+	          |           |           |
+	          v           v           v
+	      DEL cache   DEL cache   DEL cache
+	```
+	
+	مثلاً Kafka event:
+	
+	```json
+	{
+	  "type": "USER_UPDATED",
+	  "userId": 10
+	}
+	```
+	
+	Consumer:
+	
+	```java
+	@KafkaListener(topics = "user-events")
+	public void handle(UserUpdatedEvent event) {
+	    redisTemplate.delete("user:" + event.userId());
+	}
+	```
+	
+	پس جریان کلی:
+	
+	```text
+	UPDATE DB
+	   |
+	   v
+	Publish event
+	   |
+	   v
+	Kafka
+	   |
+	   v
+	Consumers
+	   |
+	   v
+	Invalidate Cache
+	```
+	
+	---
+	
+	## ولی اینجا یک مشکل مهم وجود دارد
+	
+	فرض کن کد این‌طور باشد:
+	
+	```java
+	database.update(user);
+	
+	kafka.send(event);
+	```
+	
+	DB موفق می‌شود:
+	
+	```text
+	DB updated ✅
+	```
+	
+	ولی درست قبل از `kafka.send` برنامه crash می‌کند:
+	
+	```text
+	DB updated ✅
+	Kafka event ❌
+	```
+	
+	نتیجه:
+	
+	```text
+	Database = Reza
+	Cache    = Ali
+	```
+	
+	و کسی نمی‌فهمد cache باید invalidate شود.
+	
+	این یکی از دلایلی است که **CDC / Debezium** مهم می‌شود.
+	
+	---
+	
+	# 4. CDC با Debezium
+	
+	CDC یعنی:
+	
+	**Change Data Capture**
+	
+	به جای اینکه application خودش بگوید:
+	
+	```text
+	"من DB را تغییر دادم"
+	```
+	
+	Debezium مستقیماً تغییرات database را مشاهده می‌کند.
+	
+	مثلاً:
+	
+	```text
+	Application
+	    |
+	    v
+	Database
+	    |
+	    | transaction log
+	    v
+	Debezium
+	    |
+	    v
+	Kafka
+	    |
+	    v
+	Cache Invalidation Consumer
+	    |
+	    v
+	Redis
+	```
+	
+	مثلاً DB:
+	
+	```sql
+	UPDATE users
+	SET name = 'Reza'
+	WHERE id = 10;
+	```
+	
+	PostgreSQL این تغییر را در WAL می‌نویسد:
+	
+	```text
+	PostgreSQL
+	   |
+	   v
+	WAL
+	   |
+	   v
+	Debezium
+	```
+	
+	Debezium آن را می‌خواند:
+	
+	```text
+	user id=10 changed
+	
+	before:
+	name=Ali
+	
+	after:
+	name=Reza
+	```
+	
+	و event به Kafka می‌فرستد:
+	
+	```text
+	Debezium
+	   |
+	   v
+	Kafka topic
+	   |
+	   v
+	Cache Consumer
+	   |
+	   v
+	DEL user:10
+	```
+	
+	مزیت بزرگ این است که event مستقیماً از تغییر committed شده در DB ایجاد شده است.
+	
+	---
+	
+	# 5. Write-through Cache
+	
+	روش دیگری که در سؤال آمده `write-through` است.
+	
+	در این حالت application مستقیماً database و cache را جداگانه مدیریت نمی‌کند.
+	
+	از دید application:
+	
+	```text
+	Application
+	    |
+	    v
+	Cache
+	    |
+	    v
+	Database
+	```
+	
+	هنگام write:
+	
+	```text
+	Application
+	    |
+	    | write
+	    v
+	Cache Layer
+	    |
+	    +----> Database
+	    |
+	    +----> Cache
+	```
+	
+	مثلاً:
+	
+	```text
+	set user:10 = Reza
+	```
+	
+	cache layer مسئول است:
+	
+	```text
+	1. update DB
+	2. update cache
+	```
+	
+	نتیجه:
+	
+	```text
+	Database              Cache
+	---------             -----
+	Reza                   Reza
+	```
+	
+	برخلاف cache-aside که معمولاً این شکلی است:
+	
+	```text
+	Application
+	  |
+	  +--> Database
+	  |
+	  +--> Redis
+	```
+	
+	در write-through:
+	
+	```text
+	Application
+	     |
+	     v
+	Cache Layer
+	     |
+	     v
+	Database
+	```
+	
+	---
+	
+	# یک تفاوت مهم: Update cache یا Delete cache؟
+	
+	فرض کن User تغییر کرده.
+	
+	دو انتخاب داریم.
+	
+	روش اول:
+	
+	```text
+	UPDATE DB
+	UPDATE CACHE
+	```
+	
+	روش دوم:
+	
+	```text
+	UPDATE DB
+	DELETE CACHE
+	```
+	
+	در بسیاری از سیستم‌ها روش دوم ساده‌تر و امن‌تر است:
+	
+	```text
+	DB updated
+	    |
+	    v
+	cache deleted
+	    |
+	    v
+	next request
+	    |
+	    v
+	reload from DB
+	```
+	
+	چرا؟
+	
+	چون DB همچنان source of truth باقی می‌ماند.
+	
+	---
+	
+	# ترکیب واقعی در یک سیستم production
+	
+	معمولاً فقط یک تکنیک استفاده نمی‌کنیم.
+	
+	ممکن است معماری این باشد:
+	
+	```text
+	                Write Request
+	                     |
+	                     v
+	                User Service
+	                     |
+	                     v
+	                 PostgreSQL
+	                     |
+	              Transaction Log
+	                     |
+	                     v
+	                  Debezium
+	                     |
+	                     v
+	                   Kafka
+	                     |
+	                     v
+	           Cache Invalidator
+	                     |
+	                     v
+	                   Redis
+	```
+	
+	برای read:
+	
+	```text
+	Client
+	  |
+	  v
+	Service
+	  |
+	  v
+	Redis
+	  |
+	  +--- HIT ---> return
+	  |
+	  +--- MISS
+	         |
+	         v
+	        DB
+	         |
+	         v
+	     Redis SET
+	         |
+	         v
+	      return
+	```
+	
+	و Redis همچنان TTL هم دارد:
+	
+	```text
+	Redis key
+	user:10
+	
+	TTL = 10 minutes
+	```
+	
+	بنابراین اگر event invalidation به هر دلیلی مشکل پیدا کرد:
+	
+	```text
+	Kafka failure
+	Consumer failure
+	Bug
+	```
+	
+	TTL یک safety net است:
+	
+	```text
+	stale data
+	   |
+	   v
+	TTL expires
+	   |
+	   v
+	reload from DB
+	```
+	
+	---
+	
+	### برای مصاحبه، پاسخ خوب می‌تواند این باشد:
+	
+	> I usually treat the database as the source of truth and the cache as an eventually consistent copy. For reads, I commonly use cache-aside with a TTL as a safety mechanism. When the underlying record changes, I invalidate the corresponding cache key, ideally through an event such as Kafka. In more reliable architectures, CDC tools like Debezium can publish committed database changes to Kafka and consumers invalidate or refresh the cache. For some use cases, write-through caching can also keep database and cache updates coordinated.
+	
+	خلاصه تصویری:
+	
+	```text
+	          Source of Truth
+	               DB
+	               |
+	       +-------+-------+
+	       |               |
+	      TTL           DB change
+	       |               |
+	       |               v
+	       |          Kafka / CDC
+	       |               |
+	       |               v
+	       +----------> Invalidate
+	                       |
+	                       v
+	                     Cache
+	```
+	
+	نکته‌ای که در مصاحبه Senior خیلی ارزش دارد این است که بگویی **TTL به‌تنهایی consistency mechanism قوی نیست؛ بیشتر یک fallback/safety net است.** Event invalidation یا CDC زمان stale بودن cache را بسیار کمتر می‌کند.
