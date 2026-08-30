@@ -157,7 +157,7 @@ Clients
 **پاسخ:** Cache-aside یعنی application ابتدا cache را چک می‌کند و در صورت miss، از database می‌خواند و cache را update می‌کند؛ ساده اما ممکن است stale data داشته باشد. Write-through یعنی هر write هم‌زمان به cache و database نوشته می‌شود، consistency بهتر اما write latency بیشتر. Write-behind یعنی write ابتدا در cache انجام و بعداً async به database نوشته می‌شود، throughput بالا اما ریسک data loss در صورت crash.
 
 **سوال:** چطور از cache stampede / thundering herd جلوگیری می‌کنید؟
-**پاسخ:** با استفاده از تکنیک‌هایی مثل lock/mutex (فقط یک thread اجازه دارد cache را از database پر کند و بقیه منتظر بمانند)، probabilistic early expiration، یا stale-while-revalidate (سرو کردن داده قدیمی هنگام refresh در پس‌زمینه).
+**پاسخ:** با استفاده از تکنیک‌هایی مثل lock/mutex (فقط یک thread اجازه دارد cache را از database پر کند و بقیه منتظر بمانند)، probabilistic early expiration، یا stale-while-revalidate (سرو کردن داده قدیمی هنگام refresh در پس‌زمینه).[^13]
 
 **سوال:** چطور distributed cache را با source-of-truth database consistent نگه می‌دارید؟
 **پاسخ:** با TTL مناسب برای expire خودکار، invalidation event ها (مثلاً از طریق Kafka وقتی رکورد database تغییر می‌کند) و write-through pattern. برای consistency قوی‌تر می‌توان از event-driven cache invalidation یا Change Data Capture (CDC) با ابزارهایی مثل Debezium استفاده کرد.
@@ -4896,3 +4896,573 @@ Trade-offها:
 	```
 	
 	این دقیقاً یکی از مهم‌ترین زنجیره‌های مفهومی در طراحی Microserviceهای واقعی است.
+
+[^13]: حتماً. اول خود مشکل را با یک مثال ساده ببینیم.
+	
+	فرض کن یک API داری:
+	
+	```text
+	GET /products/123
+	```
+	
+	برای سریع‌تر شدن، اطلاعات محصول را در Redis cache نگه می‌داری:
+	
+	```text
+	Client
+	  |
+	  v
+	Application
+	  |
+	  +----> Redis Cache
+	  |
+	  +----> Database
+	```
+	
+	حالت عادی این است:
+	
+	```text
+	Request
+	   |
+	   v
+	Redis
+	   |
+	   | Cache HIT
+	   v
+	"Product 123"
+	```
+	
+	پس اصلاً سراغ Database نمی‌رویم.
+	
+	اما فرض کن cache این محصول ساعت `10:00:00` منقضی شود.
+	
+	در همان لحظه 1000 درخواست می‌رسد:
+	
+	```text
+	10:00:00
+	
+	Request 1 ----\
+	Request 2 -----\
+	Request 3 ------\
+	Request 4 -------+----> Cache
+	...             /
+	Request 1000 ---/
+	                  |
+	                  v
+	              Cache MISS
+	```
+	
+	همه تقریباً همزمان می‌بینند:
+	
+	```text
+	product:123 = NOT FOUND
+	```
+	
+	و همه تصمیم می‌گیرند از Database بخوانند:
+	
+	```text
+	Req 1 ------> DB
+	Req 2 ------> DB
+	Req 3 ------> DB
+	Req 4 ------> DB
+	...
+	Req 1000 ---> DB
+	```
+	
+	یعنی به جای اینکه **یک query** به DB بزنیم:
+	
+	```text
+	1 query
+	```
+	
+	ناگهان می‌شود:
+	
+	```text
+	1000 queries
+	```
+	
+	این همان:
+	
+	```text
+	Cache Stampede
+	یا
+	Thundering Herd
+	```
+	
+	است.
+	
+	ممکن است نتیجه این شود:
+	
+	```text
+	Cache expired
+	      |
+	      v
+	1000 requests
+	      |
+	      v
+	1000 DB queries
+	      |
+	      v
+	DB CPU = 100%
+	      |
+	      v
+	slow response
+	      |
+	      v
+	timeouts
+	      |
+	      v
+	more retries
+	      |
+	      v
+	even more load
+	      |
+	      v
+	💥
+	```
+	
+	حالا سه راه‌حلی که در جواب آمده را جدا ببینیم.
+	
+	### 1. Lock / Mutex
+	
+	ایده خیلی ساده است:
+	
+	وقتی cache خالی شد، فقط **یک thread** اجازه دارد برود DB.
+	
+	مثلاً:
+	
+	```text
+	                Cache MISS
+	                    |
+	          +---------+---------+
+	          |         |         |
+	       Thread1   Thread2   Thread3
+	          |         |         |
+	          v         v         v
+	        LOCK      LOCK      LOCK
+	          |
+	          | Thread1 wins
+	          v
+	          DB
+	          |
+	          v
+	      Read Product
+	          |
+	          v
+	      Update Cache
+	          |
+	          v
+	       Unlock
+	```
+	
+	Threadهای دیگر صبر می‌کنند:
+	
+	```text
+	Thread 1 --> LOCK acquired --> DB
+	Thread 2 --> waiting...
+	Thread 3 --> waiting...
+	Thread 4 --> waiting...
+	```
+	
+	بعد Thread 1 cache را پر می‌کند:
+	
+	```text
+	DB
+	 |
+	 v
+	Product
+	 |
+	 v
+	Redis
+	
+	product:123 = {...}
+	```
+	
+	حالا بقیه threadها دیگر DB را نمی‌زنند:
+	
+	```text
+	Thread 2 --> Cache HIT
+	Thread 3 --> Cache HIT
+	Thread 4 --> Cache HIT
+	```
+	
+	پس به جای:
+	
+	```text
+	1000 Requests
+	     |
+	     v
+	1000 DB Queries
+	```
+	
+	داریم:
+	
+	```text
+	1000 Requests
+	     |
+	     v
+	1 DB Query
+	```
+	
+	در Java می‌توانی مفهومش را تقریباً این‌طوری تصور کنی:
+	
+	```java
+	Product product = cache.get(id);
+	
+	if (product == null) {
+	
+	    synchronized (lock) {
+	
+	        product = cache.get(id);
+	
+	        if (product == null) {
+	            product = database.findById(id);
+	            cache.put(id, product);
+	        }
+	    }
+	}
+	
+	return product;
+	```
+	
+	نکته مهم این `cache.get` دوم است:
+	
+	```java
+	synchronized (lock) {
+	
+	    product = cache.get(id); // check again
+	```
+	
+	چرا؟
+	
+	فرض کن:
+	
+	```text
+	Thread1 --> lock --> DB --> cache updated
+	Thread2 --> waiting
+	```
+	
+	وقتی Thread2 lock را گرفت، دیگر لازم نیست DB را بزند؛ چون Thread1 cache را پر کرده.
+	
+	به این الگو معمولاً می‌گویند:
+	
+	```text
+	Double Check
+	```
+	
+	اما یک مشکل دارد: اگر چند instance از برنامه داشته باشی:
+	
+	```text
+	        Load Balancer
+	        /     |     \
+	       v      v      v
+	     App1   App2   App3
+	```
+	
+	`synchronized` فقط داخل همان JVM کار می‌کند.
+	
+	یعنی:
+	
+	```text
+	App1 synchronized
+	```
+	
+	هیچ اطلاعی از:
+	
+	```text
+	App2 synchronized
+	```
+	
+	ندارد.
+	
+	در distributed system معمولاً از distributed lock مثل Redis استفاده می‌کنند:
+	
+	```text
+	App1 ----\
+	App2 -----+----> Redis Lock
+	App3 ----/
+	```
+	
+	مثلاً با Redisson.
+	
+	---
+	
+	### 2. Stale-While-Revalidate
+	
+	این روش جالب‌تر است.
+	
+	می‌گوید وقتی cache منقضی شد، لازم نیست فوراً داده قبلی را دور بریزیم.
+	
+	مثلاً cache شامل این است:
+	
+	```text
+	Product = iPhone
+	Fresh until = 10:00
+	Stale allowed until = 10:05
+	```
+	
+	ساعت 10:01 درخواست می‌آید.
+	
+	به جای:
+	
+	```text
+	Cache expired
+	     |
+	     v
+	Wait for DB
+	```
+	
+	می‌گوییم:
+	
+	```text
+	Client
+	  |
+	  v
+	Return old cached value immediately
+	  |
+	  +------> background refresh
+	                |
+	                v
+	               DB
+	                |
+	                v
+	             Cache
+	```
+	
+	مثلاً:
+	
+	```text
+	Request 1 --> old value returned
+	Request 2 --> old value returned
+	Request 3 --> old value returned
+	Request 4 --> old value returned
+	
+	              |
+	              +--> one background refresh
+	                       |
+	                       v
+	                      DB
+	```
+	
+	پس کاربران منتظر database نمی‌مانند.
+	
+	مثلاً cache:
+	
+	```text
+	10:00
+	
+	price = $100
+	```
+	
+	داده منقضی شده ولی هنوز قابل استفاده است.
+	
+	درخواست ساعت 10:01:
+	
+	```text
+	Client
+	  |
+	  v
+	price = $100   <-- stale response
+	```
+	
+	همزمان:
+	
+	```text
+	Background Thread
+	      |
+	      v
+	Database
+	      |
+	      v
+	price = $105
+	      |
+	      v
+	Cache updated
+	```
+	
+	درخواست بعدی:
+	
+	```text
+	Client
+	  |
+	  v
+	price = $105
+	```
+	
+	نمای کلی:
+	
+	```text
+	                   +------ DB
+	                   |
+	                   | refresh
+	                   v
+	Request ---> Cache(old) ----> Cache(new)
+	              |
+	              v
+	        return immediately
+	```
+	
+	مزیت بزرگش latency کم است.
+	
+	عیبش این است که ممکن است برای مدت کوتاهی اطلاعات قدیمی بدهی.
+	
+	برای چیزی مثل:
+	
+	```text
+	Blog posts
+	Product catalog
+	News feed
+	Configuration
+	```
+	
+	معمولاً قابل قبول است.
+	
+	ولی برای چیزی مثل:
+	
+	```text
+	Bank account balance
+	Available credit
+	Payment status
+	```
+	
+	باید خیلی محتاط باشی.
+	
+	---
+	
+	### 3. Probabilistic Early Expiration
+	
+	این یکی کمی هوشمندانه‌تر است.
+	
+	فرض کن TTL برابر 10 دقیقه است:
+	
+	```text
+	Cache created: 10:00
+	Expires:       10:10
+	```
+	
+	روش ساده می‌گوید تا `10:10` هیچ کاری نکن.
+	
+	مشکل:
+	
+	```text
+	10:09:59 --> everyone Cache HIT
+	
+	10:10:00 --> everyone Cache MISS
+	
+	10:10:00 --> 💥 DB
+	```
+	
+	Probabilistic Early Expiration می‌گوید قبل از رسیدن به انقضای واقعی، بعضی requestها با یک احتمال مشخص cache را refresh کنند.
+	
+	مثلاً:
+	
+	```text
+	10:00 ------------------------ 10:10
+	                               expiry
+	
+	                   ^
+	                   |
+	             Refresh may start
+	```
+	
+	هرچه به زمان expiration نزدیک‌تر می‌شویم، احتمال refresh بیشتر می‌شود:
+	
+	```text
+	10:05   1% chance
+	10:07   5% chance
+	10:08  15% chance
+	10:09  40% chance
+	10:09:50 80% chance
+	```
+	
+	بنابراین ممکن است در 10:09:20 یک request بگوید:
+	
+	```text
+	Cache هنوز valid است
+	
+	اما...
+	
+	من refresh را انجام می‌دهم.
+	```
+	
+	پس:
+	
+	```text
+	Request
+	   |
+	   v
+	Cache HIT
+	   |
+	   +----> return current value
+	   |
+	   +----> refresh early
+	             |
+	             v
+	            DB
+	```
+	
+	و قبل از اینکه همه درخواست‌ها به expiration برسند، cache تازه شده است:
+	
+	```text
+	10:09:20
+	old cache
+	   |
+	   v
+	refresh
+	   |
+	   v
+	new cache
+	
+	TTL reset
+	```
+	
+	در نتیجه اصلاً به این نقطه نمی‌رسیم:
+	
+	```text
+	1000 simultaneous cache misses
+	```
+	
+	---
+	
+	اگر بخواهیم سه روش را کنار هم بگذاریم:
+	
+	```text
+	                 Cache Expired
+	                      |
+	        +-------------+-------------+
+	        |             |             |
+	        v             v             v
+	      LOCK      Stale-While     Early Expiration
+	                 Revalidate
+	        |             |             |
+	        v             v             v
+	Only one        Return old       Refresh before
+	request DB      data while       actual expiry
+	                refreshing
+	        |             |             |
+	        v             v             v
+	protect DB      low latency      avoid sudden
+	                              expiration cliff
+	```
+	
+	برای مصاحبه، یک پاسخ خوب و کوتاه می‌تواند این باشد:
+	
+	> Cache stampede زمانی رخ می‌دهد که یک hot cache entry منقضی شود و تعداد زیادی request همزمان cache miss بگیرند و همگی به database مراجعه کنند. برای جلوگیری از آن می‌توان از per-key locking یا distributed lock استفاده کرد تا فقط یک request داده را refresh کند، از stale-while-revalidate برای سرو کردن مقدار قبلی هنگام refresh، و از probabilistic early expiration برای refresh کردن cache کمی قبل از expiration واقعی استفاده کرد. همچنین معمولاً به TTLها مقداری jitter اضافه می‌کنیم تا تعداد زیادی key دقیقاً در یک زمان expire نشوند.
+	
+	یک تکنیک چهارم مهم هم همین **TTL Jitter** است. مثلاً به جای اینکه 100 هزار key همگی TTL=10 دقیقه داشته باشند:
+	
+	```text
+	همه:
+	TTL = 600 sec
+	```
+	
+	تصادفی می‌کنیم:
+	
+	```text
+	Key1 = 571 sec
+	Key2 = 623 sec
+	Key3 = 594 sec
+	Key4 = 638 sec
+	...
+	```
+	
+	تا همه با هم expire نشوند.
