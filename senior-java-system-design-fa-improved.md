@@ -167,7 +167,7 @@ Clients
 ## ۵. Messaging، Queue ها و پردازش Asynchronous
 
 **سوال:** چه زمانی از message queue (Kafka، RabbitMQ، SQS) به‌جای فراخوانی مستقیم synchronous بین سرویس‌ها استفاده می‌کنید؟
-**پاسخ:** زمانی که نیاز به decoupling سرویس‌ها، مدیریت traffic spike، پردازش asynchronous یا اطمینان از تحویل پیام (حتی اگر consumer موقتاً down باشد) وجود دارد. مثلاً پردازش سفارش، ارسال notification، یا event-driven workflow ها.
+**پاسخ:** زمانی که نیاز به decoupling سرویس‌ها، مدیریت traffic spike، پردازش asynchronous یا اطمینان از تحویل پیام (حتی اگر consumer موقتاً down باشد) وجود دارد. مثلاً پردازش سفارش، ارسال notification، یا event-driven workflow ها.[^15]
 
 **سوال:** معماری Kafka را توضیح دهید: partition ها، consumer group ها، offset ها و replication. این‌ها چطور روی ordering guarantee تاثیر می‌گذارند؟
 **پاسخ:** یک topic به چند partition تقسیم می‌شود و هر پیام یک offset منحصربه‌فرد در آن partition دارد. Ordering فقط درون یک partition تضمین می‌شود، نه در کل topic. Consumer group به چند consumer اجازه می‌دهد partition ها را بین خودشان تقسیم کنند تا parallel processing انجام شود. Replication (با replication factor) کپی‌هایی از هر partition روی broker های مختلف نگه می‌دارد تا در صورت خرابی یک broker، داده از دست نرود.
@@ -6054,3 +6054,957 @@ Trade-offها:
 	```
 	
 	نکته‌ای که در مصاحبه Senior خیلی ارزش دارد این است که بگویی **TTL به‌تنهایی consistency mechanism قوی نیست؛ بیشتر یک fallback/safety net است.** Event invalidation یا CDC زمان stale بودن cache را بسیار کمتر می‌کند.
+
+[^15]: حتماً. ایده اصلی این است که بفهمیم **چه زمانی Service A باید منتظر جواب Service B بماند** و چه زمانی بهتر است فقط یک پیام بفرستد و کار خودش را ادامه دهد.
+	
+	فرض کن دو سرویس داریم:
+	
+	```text
+	Order Service
+	     |
+	     v
+	Payment Service
+	```
+	
+	دو راه کلی برای ارتباط داریم:
+	
+	```text
+	1) Synchronous
+	   REST / HTTP / gRPC
+	
+	2) Asynchronous
+	   Kafka / RabbitMQ / SQS
+	```
+	
+	## 1. ارتباط Synchronous یعنی چه؟
+	
+	مثلاً کاربر سفارش ثبت می‌کند و `Order Service` فوراً `Payment Service` را صدا می‌زند:
+	
+	```text
+	User
+	 |
+	 v
+	Order Service
+	 |
+	 | HTTP: /pay
+	 v
+	Payment Service
+	 |
+	 | Response
+	 v
+	Order Service
+	 |
+	 v
+	User
+	```
+	
+	در این مدل، `Order Service` **منتظر جواب** است.
+	
+	مثلاً:
+	
+	```text
+	Order Service ---> Payment Service
+	                      |
+	                      | processing...
+	                      |
+	Order Service <--- Payment successful
+	```
+	
+	کد ذهنی ساده:
+	
+	```java
+	PaymentResult result = paymentService.pay(order);
+	
+	if (result.isSuccessful()) {
+	    order.setStatus(PAID);
+	}
+	```
+	
+	یعنی تا زمانی که `pay()` جواب ندهد، جریان ادامه پیدا نمی‌کند.
+	
+	این روش زمانی خوب است که **همین الان به جواب نیاز داری**.
+	
+	مثلاً:
+	
+	```text
+	Login Service ---> Authentication Service
+	
+	"این password درست است؟"
+	```
+	
+	بدون جواب Authentication Service نمی‌توانی ادامه بدهی.
+	
+	---
+	
+	# اما Message Queue چه فرقی دارد؟
+	
+	بین سرویس‌ها یک واسطه قرار می‌دهیم:
+	
+	```text
+	Order Service
+	     |
+	     | OrderCreated
+	     v
+	+----------------+
+	| Kafka / MQ     |
+	+----------------+
+	     |
+	     v
+	Payment Service
+	```
+	
+	Order Service دیگر مستقیماً Payment Service را صدا نمی‌زند.
+	
+	فقط می‌گوید:
+	
+	```text
+	"یک سفارش ایجاد شد."
+	```
+	
+	و پیام را داخل Queue/Broker قرار می‌دهد.
+	
+	```text
+	Order Service
+	     |
+	     | publish
+	     v
+	+----------------------+
+	| OrderCreated         |
+	| orderId = 123        |
+	+----------------------+
+	     |
+	     v
+	Kafka
+	```
+	
+	بعداً Consumer آن را می‌گیرد:
+	
+	```text
+	Kafka
+	 |
+	 | OrderCreated
+	 v
+	Payment Service
+	```
+	
+	نکته مهم:
+	
+	```text
+	Order Service
+	     |
+	     | publish
+	     v
+	Kafka
+	     |
+	     +----> Order Service کارش تمام شد
+	```
+	
+	Order Service لازم نیست منتظر Payment Service بماند.
+	
+	---
+	
+	# 2. اولین دلیل: Decoupling
+	
+	فرض کن بدون Queue این معماری را داریم:
+	
+	```text
+	              +--> Payment Service
+	              |
+	Order Service +--> Inventory Service
+	              |
+	              +--> Notification Service
+	              |
+	              +--> Analytics Service
+	```
+	
+	Order Service باید همه سرویس‌ها را بشناسد:
+	
+	```text
+	paymentService.pay()
+	inventoryService.reserve()
+	notificationService.send()
+	analyticsService.track()
+	```
+	
+	اگر فردا یک سرویس جدید اضافه کنیم:
+	
+	```text
+	Fraud Detection Service
+	```
+	
+	باید Order Service را تغییر دهیم.
+	
+	```text
+	Order Service
+	     |
+	     +--> Payment
+	     +--> Inventory
+	     +--> Notification
+	     +--> Analytics
+	     +--> Fraud Detection
+	```
+	
+	یعنی coupling زیاد شده است.
+	
+	حالا Kafka را وسط بگذاریم:
+	
+	```text
+	                    +--> Payment Service
+	                    |
+	Order Service ---> Kafka ---> Inventory Service
+	                    |
+	                    +--> Notification Service
+	                    |
+	                    +--> Analytics Service
+	```
+	
+	Order Service فقط می‌گوید:
+	
+	```text
+	OrderCreated
+	```
+	
+	مثلاً:
+	
+	```json
+	{
+	  "orderId": 123,
+	  "userId": 55,
+	  "amount": 100
+	}
+	```
+	
+	دیگر Order Service اهمیت نمی‌دهد چه کسی این پیام را مصرف می‌کند.
+	
+	فردا می‌توانیم بدون تغییر Order Service اضافه کنیم:
+	
+	```text
+	                    +--> Payment
+	                    +--> Inventory
+	Order ---> Kafka ---+--> Notification
+	                    +--> Analytics
+	                    +--> Fraud Detection
+	```
+	
+	این همان:
+	
+	```text
+	Decoupling
+	```
+	
+	است.
+	
+	---
+	
+	# 3. دلیل دوم: مدیریت Traffic Spike
+	
+	این یکی از مهم‌ترین کاربردهای Queue است.
+	
+	فرض کن سیستم معمولاً دارد:
+	
+	```text
+	100 request / second
+	```
+	
+	ولی Black Friday ناگهان می‌شود:
+	
+	```text
+	10,000 request / second
+	```
+	
+	بدون Queue:
+	
+	```text
+	10,000 requests
+	      |
+	      v
+	Order Service
+	      |
+	      v
+	Payment Service
+	      |
+	      v
+	Database
+	```
+	
+	اگر Payment Service فقط بتواند:
+	
+	```text
+	500 request/sec
+	```
+	
+	پردازش کند، اتفاق احتمالی:
+	
+	```text
+	10,000 req/sec
+	       |
+	       v
+	Payment Service
+	       |
+	       X
+	   overloaded
+	       |
+	       +--> timeout
+	       +--> connection error
+	       +--> CPU 100%
+	       +--> DB overloaded
+	```
+	
+	ممکن است سیستم cascade failure بدهد.
+	
+	اما با Queue:
+	
+	```text
+	10,000 events/sec
+	       |
+	       v
+	+----------------+
+	| Kafka / SQS    |
+	|                |
+	| backlog        |
+	| backlog        |
+	| backlog        |
+	+----------------+
+	       |
+	       | 500/sec
+	       v
+	Payment Service
+	```
+	
+	Queue مثل یک **مخزن موقت فشار** عمل می‌کند.
+	
+	مثلاً:
+	
+	```text
+	Producer speed:
+	10,000 msg/sec
+	
+	Consumer capacity:
+	500 msg/sec
+	```
+	
+	Queue پیام‌ها را نگه می‌دارد:
+	
+	```text
+	Kafka
+	
+	[ msg ]
+	[ msg ]
+	[ msg ]
+	[ msg ]
+	[ msg ]
+	[ msg ]
+	[ msg ]
+	```
+	
+	Consumer هرچقدر ظرفیت دارد پردازش می‌کند.
+	
+	این مفهوم را معمولاً می‌توان این‌طور تصور کرد:
+	
+	```text
+	Traffic Spike
+	      |
+	      v
+	   BUFFER
+	      |
+	      v
+	Consumer
+	```
+	
+	به این کار گاهی:
+	
+	```text
+	Load leveling
+	```
+	
+	هم می‌گویند.
+	
+	---
+	
+	# 4. دلیل سوم: پردازش Asynchronous
+	
+	فرض کن کاربر سفارش ثبت می‌کند.
+	
+	بعد از ثبت سفارش باید این کارها انجام شوند:
+	
+	```text
+	1. ذخیره سفارش
+	2. ارسال email
+	3. ارسال SMS
+	4. ایجاد invoice
+	5. update analytics
+	6. loyalty points
+	```
+	
+	اگر همه synchronous باشند:
+	
+	```text
+	User
+	 |
+	 v
+	Order Service
+	 |
+	 +--> Save Order       200ms
+	 |
+	 +--> Send Email       800ms
+	 |
+	 +--> Send SMS         500ms
+	 |
+	 +--> Invoice          700ms
+	 |
+	 +--> Analytics        300ms
+	 |
+	 +--> Loyalty          400ms
+	 |
+	 v
+	
+	Total ≈ 2900ms
+	```
+	
+	کاربر تقریباً 3 ثانیه منتظر می‌ماند.
+	
+	اما واقعاً آیا کاربر لازم است منتظر ارسال ایمیل بماند؟
+	
+	نه.
+	
+	پس:
+	
+	```text
+	User
+	 |
+	 v
+	Order Service
+	 |
+	 +--> Save Order
+	 |
+	 +--> publish OrderCreated
+	 |
+	 v
+	Response:
+	"Order accepted"
+	```
+	
+	مثلاً:
+	
+	```text
+	300ms
+	```
+	
+	سپس در background:
+	
+	```text
+	                     +--> Email Service
+	                     |
+	OrderCreated ---> Kafka ---> SMS Service
+	                     |
+	                     +--> Invoice Service
+	                     |
+	                     +--> Analytics
+	```
+	
+	بنابراین:
+	
+	```text
+	Critical work
+	    =
+	synchronous
+	
+	Non-critical work
+	    =
+	asynchronous
+	```
+	
+	---
+	
+	# 5. دلیل چهارم: Consumer ممکن است Down باشد
+	
+	فرض کن Notification Service موقتاً down شده:
+	
+	```text
+	Order Service ---> Notification Service
+	                         X
+	                       DOWN
+	```
+	
+	اگر synchronous باشد:
+	
+	```text
+	POST /send-email
+	      |
+	      X
+	Connection refused
+	```
+	
+	ممکن است ایمیل کلاً از دست برود.
+	
+	ولی اگر Queue داشته باشیم:
+	
+	```text
+	Order Service
+	     |
+	     | NotificationRequested
+	     v
+	Kafka
+	     |
+	     X
+	Notification Service DOWN
+	```
+	
+	پیام داخل Kafka باقی می‌ماند:
+	
+	```text
+	Kafka
+	
+	[NotificationRequested]
+	[NotificationRequested]
+	[NotificationRequested]
+	```
+	
+	بعد Notification Service بالا می‌آید:
+	
+	```text
+	Kafka
+	 |
+	 v
+	Notification Service
+	 |
+	 +--> message 1
+	 +--> message 2
+	 +--> message 3
+	```
+	
+	این یکی از مزایای مهم messaging است:
+	
+	```text
+	Producer و Consumer لازم نیست
+	همزمان UP باشند.
+	```
+	
+	در synchronous:
+	
+	```text
+	Producer UP
+	Consumer DOWN
+	     =
+	request fails
+	```
+	
+	در async:
+	
+	```text
+	Producer UP
+	Consumer DOWN
+	     =
+	message waits
+	```
+	
+	---
+	
+	# 6. یک مثال واقعی: Order Processing
+	
+	فرض کن معماری فروشگاه داریم:
+	
+	```text
+	                +----------------+
+	                | Order Service  |
+	                +----------------+
+	                        |
+	                        | OrderCreated
+	                        v
+	                 +-------------+
+	                 |    Kafka    |
+	                 +-------------+
+	                    /    |    \
+	                   /     |     \
+	                  v      v      v
+	
+	             Payment  Inventory Notification
+	             Service   Service     Service
+	```
+	
+	Order Service فقط این event را publish می‌کند:
+	
+	```text
+	OrderCreated
+	
+	orderId = 1001
+	amount = 120 EUR
+	customerId = 77
+	```
+	
+	حالا هر سرویس مستقل کار خودش را انجام می‌دهد:
+	
+	```text
+	Payment Service
+	    |
+	    +--> charge customer
+	
+	Inventory Service
+	    |
+	    +--> reserve stock
+	
+	Notification Service
+	    |
+	    +--> send email
+	```
+	
+	---
+	
+	# 7. Event-driven Workflow
+	
+	می‌توان حتی یک workflow کامل ساخت.
+	
+	مثلاً:
+	
+	```text
+	OrderCreated
+	     |
+	     v
+	Payment Service
+	     |
+	     | PaymentCompleted
+	     v
+	Kafka
+	     |
+	     v
+	Inventory Service
+	     |
+	     | InventoryReserved
+	     v
+	Kafka
+	     |
+	     v
+	Shipping Service
+	```
+	
+	جریان کامل:
+	
+	```text
+	Order
+	 |
+	 v
+	OrderCreated
+	 |
+	 v
+	Payment
+	 |
+	 v
+	PaymentCompleted
+	 |
+	 v
+	Inventory
+	 |
+	 v
+	InventoryReserved
+	 |
+	 v
+	Shipping
+	```
+	
+	این همان چیزی است که در معماری‌های:
+	
+	```text
+	Event-Driven Architecture
+	```
+	
+	زیاد می‌بینی.
+	
+	---
+	
+	# 8. ولی Message Queue همیشه بهتر نیست
+	
+	این نکته در مصاحبه خیلی مهم است.
+	
+	فرض کن سرویس A می‌خواهد بداند:
+	
+	```text
+	"موجودی فعلی این کالا چقدر است؟"
+	```
+	
+	مثلاً:
+	
+	```text
+	Product Service
+	      |
+	      | GET /inventory/123
+	      v
+	Inventory Service
+	      |
+	      | stock = 12
+	      v
+	Product Service
+	```
+	
+	اینجا synchronous بسیار منطقی‌تر است.
+	
+	چرا؟
+	
+	چون Service A **الان به جواب نیاز دارد**.
+	
+	با Kafka خیلی پیچیده می‌شود:
+	
+	```text
+	Product Service
+	      |
+	      | InventoryRequested
+	      v
+	Kafka
+	      |
+	      v
+	Inventory Service
+	      |
+	      | InventoryResponse
+	      v
+	Kafka
+	      |
+	      v
+	Product Service
+	```
+	
+	در حالی که یک HTTP call ساده کافی بود.
+	
+	---
+	
+	# یک قانون ذهنی خیلی خوب
+	
+	از خودت بپرس:
+	
+	```text
+	آیا caller برای ادامه کار
+	همین الان به جواب نیاز دارد؟
+	```
+	
+	اگر:
+	
+	```text
+	YES
+	 |
+	 v
+	Synchronous
+	REST / gRPC
+	```
+	
+	اگر:
+	
+	```text
+	NO
+	 |
+	 v
+	Message Queue
+	Kafka / RabbitMQ / SQS
+	```
+	
+	البته استثنا وجود دارد، ولی برای فهم اولیه قانون بسیار خوبی است.
+	
+	---
+	
+	# مقایسه تصویری
+	
+	### Synchronous
+	
+	```text
+	Service A
+	   |
+	   | request
+	   v
+	Service B
+	   |
+	   | processing
+	   |
+	   v
+	response
+	   |
+	   v
+	Service A continues
+	```
+	
+	Service A باید منتظر بماند:
+	
+	```text
+	A: --------WAITING--------->
+	B:       processing
+	```
+	
+	---
+	
+	### Asynchronous
+	
+	```text
+	Service A
+	   |
+	   | message
+	   v
+	Kafka
+	   |
+	   v
+	Service B
+	```
+	
+	Service A:
+	
+	```text
+	A: publish ---> continue
+	```
+	
+	Service B:
+	
+	```text
+	            later
+	              |
+	              v
+	Kafka ---> process
+	```
+	
+	---
+	
+	# Kafka، RabbitMQ و SQS چه نقشی دارند؟
+	
+	هر سه برای asynchronous messaging استفاده می‌شوند، ولی مدلشان کمی متفاوت است.
+	
+	برای فهم اولیه:
+	
+	```text
+	               Messaging
+	                   |
+	       +-----------+-----------+
+	       |           |           |
+	       v           v           v
+	     Kafka      RabbitMQ      SQS
+	```
+	
+	یک تصویر ذهنی ساده:
+	
+	```text
+	Kafka
+	بیشتر شبیه event log / event streaming
+	
+	RabbitMQ
+	بیشتر شبیه message broker / queue
+	
+	SQS
+	managed queue در AWS
+	```
+	
+	مثلاً Kafka در چنین معماری‌ای خیلی رایج است:
+	
+	```text
+	                    +--> Fraud
+	                    |
+	PaymentCompleted --> Kafka --> Analytics
+	                    |
+	                    +--> Notification
+	                    |
+	                    +--> Accounting
+	```
+	
+	چون ممکن است یک event چند consumer داشته باشد.
+	
+	---
+	
+	# یک نکته بسیار مهم در مصاحبه
+	
+	استفاده از Queue مجانی نیست؛ complexity اضافه می‌کند.
+	
+	مثلاً باید درباره این مسائل فکر کنی:
+	
+	```text
+	message duplication
+	      |
+	      v
+	idempotency
+	
+	message failure
+	      |
+	      v
+	retry
+	
+	repeated failure
+	      |
+	      v
+	DLQ
+	
+	ordering
+	      |
+	      v
+	partition / routing
+	
+	consumer down
+	      |
+	      v
+	backlog
+	
+	schema changes
+	      |
+	      v
+	event versioning
+	```
+	
+	یعنی:
+	
+	```text
+	Synchronous
+	     |
+	     +--> ساده‌تر
+	
+	Messaging
+	     |
+	     +--> resilient تر
+	     +--> scalable تر
+	     +--> decoupled تر
+	     |
+	     +--> ولی پیچیده‌تر
+	```
+	
+	---
+	
+	## خلاصه‌ای که برای مصاحبه حفظ کنی
+	
+	اگر ازت پرسیدند:
+	
+	**When would you use a message queue instead of synchronous service-to-service communication?**
+	
+	در ذهن خودت این شکل را داشته باش:
+	
+	```text
+	                 Need immediate response?
+	                    /          \
+	                  YES           NO
+	                   |             |
+	                   v             v
+	              REST/gRPC       Queue/Kafka
+	                                  |
+	                 +----------------+----------------+
+	                 |                |                |
+	                 v                v                v
+	             decoupling      traffic spikes    async work
+	                                                  |
+	                                                  v
+	                                         consumer can be down
+	```
+	
+	یعنی Message Queue را بیشتر زمانی انتخاب می‌کنیم که **نیازی به response فوری نداریم، می‌خواهیم producer و consumer از هم مستقل باشند، spikeهای ترافیکی را buffer کنیم، پردازش را asynchronous انجام دهیم یا پیام حتی هنگام down بودن consumer از بین نرود.**
+	
+	و مثال خیلی خوب مصاحبه‌ای:
+	
+	```text
+	Order Service
+	      |
+	      | OrderCreated
+	      v
+	    Kafka
+	   /  |   \
+	  v   v    v
+	Pay Stock Email
+	```
+	
+	به‌جای:
+	
+	```text
+	Order
+	 |
+	 +--> Payment
+	 +--> Inventory
+	 +--> Email
+	```
+	
+	اولی معمولاً برای سیستم‌های بزرگ‌تر **decoupled، resilient و scalable**‌تر است.
