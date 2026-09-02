@@ -6926,7 +6926,7 @@ Trade-offها:
 	ordering
 	      |
 	      v
-	partition / routing
+	partition / routing[^16]
 	
 	consumer down
 	      |
@@ -7008,3 +7008,775 @@ Trade-offها:
 	```
 	
 	اولی معمولاً برای سیستم‌های بزرگ‌تر **decoupled، resilient و scalable**‌تر است.
+
+[^16]: حتماً. این سه مورد از مهم‌ترین چالش‌های واقعی در سیستم‌های message-driven هستند. یکی‌یکی با مثال و شکل متنی توضیح می‌دهم.
+	
+	## 1) Ordering → Partition / Routing
+	
+	فرض کن برای یک حساب بانکی این eventها تولید می‌شوند:
+	
+	```text
+	Account = A123
+	
+	1. Deposit  +100
+	2. Withdraw  -50
+	3. Deposit  +20
+	```
+	
+	ترتیب درست:
+	
+	```text
+	+100
+	  |
+	  v
+	-50
+	  |
+	  v
+	+20
+	```
+	
+	موجودی نهایی:
+	
+	```text
+	0
+	+100 = 100
+	-50  = 50
+	+20  = 70
+	```
+	
+	اما اگر messageها به ترتیب متفاوت پردازش شوند:
+	
+	```text
+	Withdraw -50
+	    |
+	    v
+	Deposit +20
+	    |
+	    v
+	Deposit +100
+	```
+	
+	ممکن است business logic اشتباه شود، مخصوصاً اگر مثلاً برداشت از موجودی صفر مجاز نباشد.
+	
+	### مشکل در Kafka از کجا می‌آید؟
+	
+	فرض کن topic سه partition دارد:
+	
+	```text
+	Topic: account-events
+	
+	Partition 0
+	Partition 1
+	Partition 2
+	```
+	
+	و eventهای یک account تصادفی بین partitionها پخش شوند:
+	
+	```text
+	Deposit +100  ---> Partition 0
+	Withdraw -50  ---> Partition 2
+	Deposit +20   ---> Partition 1
+	```
+	
+	حالا consumerها ممکن است موازی کار کنند:
+	
+	```text
+	P0 ---> Consumer A
+	P1 ---> Consumer B
+	P2 ---> Consumer C
+	```
+	
+	و ترتیب processing تضمین نمی‌شود.
+	
+	مثلاً:
+	
+	```text
+	time --->
+	
+	Consumer C: Withdraw -50
+	Consumer B: Deposit +20
+	Consumer A: Deposit +100
+	```
+	
+	در حالی که producer ترتیب دیگری فرستاده بود.
+	
+	### راه‌حل: Routing با Key
+	
+	در Kafka معمولاً message را با یک key منتشر می‌کنیم.
+	
+	مثلاً:
+	
+	```text
+	key = accountId
+	```
+	
+	برای همه eventهای حساب `A123`:
+	
+	```text
+	key = A123
+	```
+	
+	Kafka با hash کردن key، همه eventهای آن account را به یک partition مشخص می‌فرستد:
+	
+	```text
+	A123 --> hash(A123) --> Partition 1
+	```
+	
+	پس:
+	
+	```text
+	Partition 1:
+	
+	[Deposit +100]
+	      |
+	[Withdraw -50]
+	      |
+	[Deposit +20]
+	```
+	
+	و Kafka ترتیب پیام‌ها را **داخل یک partition** حفظ می‌کند.
+	
+	نکته مهم:
+	
+	```text
+	Kafka ordering guarantee
+	        |
+	        v
+	within a partition
+	```
+	
+	نه لزوماً در کل topic.
+	
+	### شکل کلی
+	
+	```text
+	Account A123 events
+	       |
+	       | key=A123
+	       v
+	+------------------+
+	|   Partition 1    |
+	|                  |
+	| Deposit +100     |
+	| Withdraw -50     |
+	| Deposit +20      |
+	+------------------+
+	       |
+	       v
+	    Consumer
+	```
+	
+	برای حساب دیگر:
+	
+	```text
+	Account B555
+	       |
+	       | key=B555
+	       v
+	Partition 2
+	```
+	
+	در نتیجه:
+	
+	```text
+	A123 events ---> Partition 1 ---> ordered
+	B555 events ---> Partition 2 ---> ordered
+	```
+	
+	و در عین حال processing می‌تواند parallel باشد.
+	
+	### قانون ذهنی
+	
+	اگر ordering برای یک entity مهم است:
+	
+	```text
+	orderId
+	accountId
+	customerId
+	paymentId
+	```
+	
+	اغلب همان entity را message key قرار می‌دهیم.
+	
+	مثلاً:
+	
+	```text
+	key = orderId
+	```
+	
+	تا همه eventهای یک سفارش بروند یک partition:
+	
+	```text
+	OrderCreated
+	PaymentCompleted
+	InventoryReserved
+	OrderShipped
+	```
+	
+	به ترتیب:
+	
+	```text
+	Partition X
+	
+	OrderCreated
+	    |
+	PaymentCompleted
+	    |
+	InventoryReserved
+	    |
+	OrderShipped
+	```
+	
+	---
+	
+	# 2) Consumer Down → Backlog
+	
+	حالا فرض کن producer خیلی راحت message تولید می‌کند:
+	
+	```text
+	Order Service
+	     |
+	     | OrderCreated
+	     v
+	Kafka
+	     |
+	     v
+	Notification Service
+	```
+	
+	ولی Notification Service down می‌شود:
+	
+	```text
+	Order Service
+	     |
+	     v
+	Kafka
+	     |
+	     X
+	Notification Service DOWN
+	```
+	
+	آیا messageها از بین می‌روند؟
+	
+	در Kafka معمولاً نه، چون messageها داخل topic نگهداری می‌شوند.
+	
+	مثلاً producer همچنان message می‌فرستد:
+	
+	```text
+	Kafka
+	
+	[message 1]
+	[message 2]
+	[message 3]
+	[message 4]
+	[message 5]
+	```
+	
+	Consumer خاموش است، پس پیام‌ها هنوز پردازش نشده‌اند.
+	
+	این پیام‌های پردازش‌نشده را به‌صورت مفهومی می‌توانیم backlog بنامیم.
+	
+	```text
+	Producer
+	   |
+	   | 1000 msg/sec
+	   v
+	+----------------------+
+	| Kafka                |
+	|                      |
+	| msg                   |
+	| msg                   |
+	| msg                   |
+	| msg     <-- backlog   |
+	| msg                   |
+	+----------------------+
+	       |
+	       X
+	   Consumer down
+	```
+	
+	### وقتی Consumer دوباره بالا می‌آید
+	
+	```text
+	Kafka
+	 |
+	 | pending messages
+	 v
+	Consumer
+	```
+	
+	Consumer از جایی که قبلاً رسیده بود ادامه می‌دهد.
+	
+	مثلاً:
+	
+	```text
+	Kafka offsets:
+	
+	0
+	1
+	2
+	3
+	4
+	5
+	6
+	7
+	8
+	9
+	```
+	
+	Consumer تا offset 4 را خوانده:
+	
+	```text
+	0 1 2 3 4
+	        ^
+	   last processed
+	```
+	
+	در زمان down شدن Kafka همچنان message می‌گیرد:
+	
+	```text
+	5 6 7 8 9 10 11 12
+	```
+	
+	وقتی consumer برگردد:
+	
+	```text
+	starts from offset 5
+	```
+	
+	و ادامه می‌دهد.
+	
+	### Consumer Lag
+	
+	در Kafka اصطلاح مهم‌تر معمولاً `consumer lag` است.
+	
+	مثلاً:
+	
+	```text
+	latest Kafka offset = 10000
+	
+	consumer offset = 7000
+	```
+	
+	پس:
+	
+	```text
+	lag = 10000 - 7000
+	    = 3000 messages
+	```
+	
+	یعنی consumer حدود 3000 پیام عقب است.
+	
+	شکل:
+	
+	```text
+	Kafka:
+	
+	0 ---------------- 7000 ---------------- 10000
+	                  ^                     ^
+	                  |                     |
+	            Consumer offset        Latest offset
+	
+	                  <---- 3000 ---->
+	                       lag
+	```
+	
+	اگر consumer down باشد، lag رشد می‌کند:
+	
+	```text
+	Time 10:00 -> lag = 0
+	Time 10:05 -> lag = 5,000
+	Time 10:10 -> lag = 20,000
+	Time 10:30 -> lag = 100,000
+	```
+	
+	این backlog ممکن است بعداً مشکل ایجاد کند.
+	
+	مثلاً consumer بعد از recovery باید حجم زیادی پیام پردازش کند:
+	
+	```text
+	Backlog = 1,000,000 messages
+	```
+	
+	اگر ظرفیت consumer:
+	
+	```text
+	5,000 msg/sec
+	```
+	
+	باشد، مدتی طول می‌کشد تا catch up کند.
+	
+	### راه‌حل‌های معمول
+	
+	مثلاً scale out کردن consumerها:
+	
+	```text
+	Before:
+	
+	Partition 0 ---> Consumer A
+	Partition 1 ---> Consumer A
+	Partition 2 ---> Consumer A
+	```
+	
+	بعد:
+	
+	```text
+	Partition 0 ---> Consumer A
+	Partition 1 ---> Consumer B
+	Partition 2 ---> Consumer C
+	```
+	
+	پس backlog سریع‌تر خالی می‌شود.
+	
+	اما تعداد consumerهای فعال در یک consumer group عملاً از تعداد partitionها بیشتر سود نمی‌برد.
+	
+	مثلاً:
+	
+	```text
+	3 partitions
+	10 consumers
+	```
+	
+	نتیجه:
+	
+	```text
+	3 consumers working
+	7 consumers idle
+	```
+	
+	---
+	
+	# 3) Schema Changes → Event Versioning
+	
+	این یکی در سیستم‌های واقعی خیلی مهم است.
+	
+	فرض کن امروز این event را داریم:
+	
+	```json
+	{
+	  "orderId": 1001,
+	  "amount": 120
+	}
+	```
+	
+	Consumerها انتظار همین structure را دارند.
+	
+	```text
+	Order Service
+	     |
+	     | OrderCreated
+	     v
+	Kafka
+	     |
+	     +--> Payment Service
+	     |
+	     +--> Analytics Service
+	```
+	
+	هر consumer کدی دارد شبیه:
+	
+	```java
+	event.getOrderId();
+	event.getAmount();
+	```
+	
+	حالا چند ماه بعد business می‌گوید currency هم اضافه کنیم:
+	
+	```json
+	{
+	  "orderId": 1001,
+	  "amount": 120,
+	  "currency": "EUR"
+	}
+	```
+	
+	این تغییر معمولاً اگر additive باشد، قابل مدیریت‌تر است.
+	
+	اما فرض کن field را rename کنیم:
+	
+	قبلاً:
+	
+	```json
+	{
+	  "amount": 120
+	}
+	```
+	
+	جدید:
+	
+	```json
+	{
+	  "totalAmount": 120
+	}
+	```
+	
+	Consumer قدیمی همچنان دنبال:
+	
+	```text
+	amount
+	```
+	
+	می‌گردد.
+	
+	ولی producer دیگر:
+	
+	```text
+	totalAmount
+	```
+	
+	می‌فرستد.
+	
+	پس ممکن است consumer بشکند:
+	
+	```text
+	Producer V2
+	    |
+	    | totalAmount
+	    v
+	Kafka
+	    |
+	    v
+	Consumer V1
+	    |
+	    X
+	expects "amount"
+	```
+	
+	این مشکل همان schema compatibility است.
+	
+	## Event Versioning یعنی چه؟
+	
+	یعنی eventها را version کنیم.
+	
+	مثلاً:
+	
+	```text
+	OrderCreatedV1
+	OrderCreatedV2
+	```
+	
+	نسخه اول:
+	
+	```json
+	{
+	  "version": 1,
+	  "orderId": 1001,
+	  "amount": 120
+	}
+	```
+	
+	نسخه دوم:
+	
+	```json
+	{
+	  "version": 2,
+	  "orderId": 1001,
+	  "amount": 120,
+	  "currency": "EUR"
+	}
+	```
+	
+	Consumer می‌تواند بگوید:
+	
+	```text
+	if version == 1
+	   process V1
+	
+	if version == 2
+	   process V2
+	```
+	
+	مثلاً:
+	
+	```text
+	Kafka
+	 |
+	 +--> OrderCreated v1
+	 |
+	 +--> OrderCreated v2
+	```
+	
+	یا event type جدا داشته باشیم:
+	
+	```text
+	order.created.v1
+	order.created.v2
+	```
+	
+	بسته به design.
+	
+	### Backward Compatibility
+	
+	فرض کن schema قدیمی:
+	
+	```json
+	{
+	  "orderId": 1,
+	  "amount": 100
+	}
+	```
+	
+	schema جدید:
+	
+	```json
+	{
+	  "orderId": 1,
+	  "amount": 100,
+	  "currency": "EUR"
+	}
+	```
+	
+	Consumer قدیمی `currency` را نمی‌شناسد ولی هنوز می‌تواند:
+	
+	```text
+	orderId
+	amount
+	```
+	
+	را بخواند.
+	
+	پس تغییر backward-compatible است.
+	
+	به‌صورت ذهنی:
+	
+	```text
+	Old Consumer
+	     |
+	     v
+	New Event
+	
+	known fields:
+	orderId   OK
+	amount    OK
+	
+	unknown:
+	currency  ignored
+	```
+	
+	اما حذف field خطرناک‌تر است.
+	
+	مثلاً از:
+	
+	```json
+	{
+	  "orderId": 1,
+	  "amount": 100
+	}
+	```
+	
+	برسیم به:
+	
+	```json
+	{
+	  "orderId": 1
+	}
+	```
+	
+	Consumer قدیمی:
+	
+	```text
+	event.amount
+	```
+	
+	را لازم دارد و ممکن است fail کند.
+	
+	### تغییرهای نسبتاً امن
+	
+	معمولاً:
+	
+	```text
+	Adding optional field
+	        |
+	        v
+	safer
+	```
+	
+	مثلاً:
+	
+	```json
+	{
+	  "orderId": 100,
+	  "currency": "EUR"
+	}
+	```
+	
+	### تغییرهای خطرناک
+	
+	```text
+	rename field
+	remove field
+	change type
+	change meaning
+	```
+	
+	مثلاً type قبلاً:
+	
+	```json
+	"amount": 100
+	```
+	
+	و بعد شود:
+	
+	```json
+	"amount": "100 EUR"
+	```
+	
+	Consumer انتظار `number` داشته:
+	
+	```text
+	number expected
+	      |
+	      v
+	string received
+	      |
+	      X
+	```
+	
+	---
+	
+	# یک تصویر کلی برای هر سه مفهوم
+	
+	```text
+	                    Messaging Challenges
+	                           |
+	          +----------------+----------------+
+	          |                |                |
+	          v                v                v
+	      Ordering        Consumer Down      Schema Change
+	          |                |                |
+	          v                v                v
+	 Partition/Key         Backlog/Lag       Versioning
+	          |                |                |
+	          v                v                v
+	same entity          messages wait      compatibility
+	same partition       until recovery     between versions
+	```
+	
+	اگر بخواهم خیلی خلاصه بگویم:
+	
+	```text
+	Ordering
+	---------
+	همه eventهای مربوط به یک entity
+	را به یک partition بفرست.
+	
+	Consumer Down
+	-------------
+	پیام‌ها باقی می‌مانند و backlog/lag
+	ایجاد می‌شود تا consumer برگردد.
+	
+	Schema Changes
+	--------------
+	Producer و Consumer ممکن است
+	نسخه‌های متفاوت داشته باشند،
+	پس schema را backward-compatible
+	و versioned طراحی کن.
+	```
+	
+	برای مصاحبه، سه عبارت خیلی مهمی که کنار این‌ها باید یادت بماند این‌ها هستند:
+	
+	```text
+	Ordering        -> Message Key / Partition
+	Consumer Down   -> Consumer Lag / Backlog
+	Schema Changes  -> Backward Compatibility / Event Versioning
+	```

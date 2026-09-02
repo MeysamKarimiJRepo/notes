@@ -263,11 +263,11 @@ A: Auf Wiedersehen, Andrea!
 
 ## 11. Vorname و Familienname
 
-| آلمانی | معنی |
-|---|---|
-| der Vorname | نام کوچک |
+| آلمانی                      | معنی         |
+| --------------------------- | ------------ |
+| der Vorname                 | نام کوچک     |
 | der Familienname / Nachname | نام خانوادگی |
-| der Name | نام (کلی) |
+| der Name                    | نام (کلی)    |
 
 مثال:
 - Wie ist Ihr Vorname? – Mein Vorname ist Meysam.
