@@ -87,7 +87,7 @@ CDC reads the database's transaction/replication log (Postgres WAL, MySQL binlog
 Use `MERGE` on a stable business key instead of blind `INSERT`. Persist the high-water mark (max timestamp or CDC offset) only *after* the write commits — never before. That makes the load idempotent: rerunning with the same watermark reprocesses the same rows into the same end state, with no duplication.
 
 **6. How would you handle inserts, updates, and deletes from a source database in Snowflake?**
-Inserts/updates: `MERGE ... WHEN MATCHED THEN UPDATE ... WHEN NOT MATCHED THEN INSERT`. Deletes: soft-delete (`_fivetran_deleted = true`, filtered by downstream views) is usually preferred — it preserves history and is reversible. Hard delete (`WHEN MATCHED AND operation='D' THEN DELETE`) when storage or compliance requires actually removing the row.
+Inserts/updates: `MERGE ... WHEN MATCHED THEN UPDATE ... WHEN NOT MATCHED THEN INSERT`. Deletes: soft-delete (`_fivetran_deleted[^1] = true`, filtered by downstream views) is usually preferred — it preserves history and is reversible. Hard delete (`WHEN MATCHED AND operation='D' THEN DELETE`) when storage or compliance requires actually removing the row.
 
 **7. Incremental load vs CDC vs full refresh.**
 Full refresh reloads everything every run — simplest and safest, but expensive at scale; good for small reference tables. Incremental pulls only rows changed since a watermark — cheaper, but blind to hard deletes and vulnerable to timestamp issues. CDC is log-based, captures every change including deletes, near-real-time — but adds load to the source and requires log retention to always exceed your maximum downtime.
@@ -1807,3 +1807,497 @@ All fully answered above — cross-references so you can drill them fast in one 
 ---
 
 _End of answered question bank._
+
+[^1]: Absolutely. This question is really about **CDC (Change Data Capture)**: how you keep a Snowflake table synchronized with a source database such as PostgreSQL, MySQL, or Oracle when rows are **inserted, updated, or deleted**.
+	
+	Let's break the answer down.
+	
+	---
+	
+	## 1. The basic problem
+	
+	Imagine the source database has:
+	
+	```text
+	CUSTOMER
+	------------------------------------------------
+	ID     NAME       EMAIL
+	1      Alice      alice@example.com
+	2      Bob        bob@example.com
+	3      Charlie    charlie@example.com
+	```
+	
+	Your Snowflake table contains the same data.
+	
+	Then the source database changes:
+	
+	```text
+	INSERT customer 4 - David
+	UPDATE customer 2 - Bob → Robert
+	DELETE customer 3 - Charlie
+	```
+	
+	You need Snowflake to reflect those changes.
+	
+	There are generally two approaches:
+	
+	```text
+	Source DB
+	   │
+	   │ CDC / replication
+	   ▼
+	Snowflake staging table
+	   │
+	   │ MERGE
+	   ▼
+	Snowflake target table
+	```
+	
+	---
+	
+	# 2. Inserts
+	
+	Suppose a new customer appears in the source:
+	
+	```sql
+	INSERT INTO customer
+	(id, name, email)
+	VALUES
+	(4, 'David', 'david@example.com');
+	```
+	
+	The CDC pipeline might produce something like:
+	
+	```text
+	ID | NAME  | EMAIL              | OPERATION
+	---+-------+--------------------+----------
+	4  | David | david@example.com  | I
+	```
+	
+	`I` means **INSERT**.
+	
+	Snowflake needs to add this row.
+	
+	A `MERGE` is commonly used:
+	
+	```sql
+	MERGE INTO customer_target t
+	USING customer_staging s
+	ON t.id = s.id
+	
+	WHEN NOT MATCHED THEN
+	    INSERT (id, name, email)
+	    VALUES (s.id, s.name, s.email);
+	```
+	
+	The important part is:
+	
+	```sql
+	WHEN NOT MATCHED THEN INSERT
+	```
+	
+	Meaning:
+	
+	> "If this ID doesn't already exist in the target, insert it."
+	
+	---
+	
+	# 3. Updates
+	
+	Now suppose:
+	
+	```text
+	Before:
+	
+	ID = 2
+	NAME = Bob
+	```
+	
+	The source changes it:
+	
+	```sql
+	UPDATE customer
+	SET name = 'Robert'
+	WHERE id = 2;
+	```
+	
+	CDC might give Snowflake:
+	
+	```text
+	ID | NAME   | EMAIL             | OPERATION
+	---+--------+-------------------+----------
+	2  | Robert | bob@example.com   | U
+	```
+	
+	Now the `MERGE` finds:
+	
+	```text
+	target.id = staging.id
+	```
+	
+	So this condition is true:
+	
+	```sql
+	WHEN MATCHED THEN UPDATE
+	```
+	
+	For example:
+	
+	```sql
+	MERGE INTO customer_target t
+	USING customer_staging s
+	ON t.id = s.id
+	
+	WHEN MATCHED THEN
+	    UPDATE SET
+	        t.name = s.name,
+	        t.email = s.email
+	
+	WHEN NOT MATCHED THEN
+	    INSERT (id, name, email)
+	    VALUES (s.id, s.name, s.email);
+	```
+	
+	So:
+	
+	```text
+	Source                    Snowflake
+	------                    ---------
+	2, Robert       --->      2, Robert
+	```
+	
+	---
+	
+	# 4. Deletes are slightly more complicated
+	
+	This is the interesting part of the interview question.
+	
+	Suppose the source deletes:
+	
+	```sql
+	DELETE FROM customer
+	WHERE id = 3;
+	```
+	
+	You could physically delete the row from Snowflake:
+	
+	```sql
+	WHEN MATCHED
+	     AND s.operation = 'D'
+	THEN DELETE
+	```
+	
+	For example:
+	
+	```sql
+	MERGE INTO customer_target t
+	USING customer_staging s
+	ON t.id = s.id
+	
+	WHEN MATCHED AND s.operation = 'D'
+	    THEN DELETE
+	
+	WHEN MATCHED AND s.operation <> 'D'
+	    THEN UPDATE SET
+	        t.name = s.name,
+	        t.email = s.email
+	
+	WHEN NOT MATCHED
+	    THEN INSERT (...);
+	```
+	
+	Afterward:
+	
+	```text
+	Snowflake:
+	
+	1 Alice
+	2 Robert
+	3 <-- gone
+	4 David
+	```
+	
+	That's called a **hard delete**.
+	
+	---
+	
+	# 5. Why would we NOT delete the row?
+	
+	In data warehouses, historical information is often valuable.
+	
+	Imagine:
+	
+	```text
+	Customer 3
+	Charlie
+	```
+	
+	was deleted from the operational database.
+	
+	If you physically delete it from Snowflake, you lose the information that:
+	
+	> Customer 3 existed.
+	
+	This can be problematic for:
+	
+	- historical reporting
+	    
+	- auditing
+	    
+	- debugging
+	    
+	- financial analysis
+	    
+	- regulatory requirements
+	    
+	- data lineage
+	    
+	- historical analytics
+	    
+	
+	So instead of:
+	
+	```text
+	DELETE row
+	```
+	
+	you can do:
+	
+	```text
+	UPDATE row
+	SET _fivetran_deleted = TRUE
+	```
+	
+	This is called a **soft delete**.
+	
+	---
+	
+	# 6. What is `_fivetran_deleted`?
+	
+	This particular field comes from **Fivetran**.
+	
+	Fivetran is a data integration/ELT platform that can replicate data from operational databases into Snowflake.
+	
+	For example, instead of Snowflake containing:
+	
+	```text
+	ID | NAME
+	---+-------
+	1  | Alice
+	2  | Bob
+	```
+	
+	you might have:
+	
+	```text
+	ID | NAME  | _FIVETRAN_DELETED
+	---+-------+------------------
+	1  | Alice | FALSE
+	2  | Bob   | TRUE
+	```
+	
+	The second row hasn't physically disappeared.
+	
+	Instead:
+	
+	```text
+	_FIVETRAN_DELETED = TRUE
+	```
+	
+	means:
+	
+	> This record was deleted from the source system.
+	
+	---
+	
+	# 7. Then how do users see only active records?
+	
+	You can create a view:
+	
+	```sql
+	CREATE VIEW active_customers AS
+	SELECT *
+	FROM customer
+	WHERE _fivetran_deleted = FALSE;
+	```
+	
+	Now:
+	
+	```sql
+	SELECT *
+	FROM active_customers;
+	```
+	
+	returns:
+	
+	```text
+	ID | NAME
+	---+-------
+	1  | Alice
+	```
+	
+	Even though the physical table still contains:
+	
+	```text
+	ID | NAME  | _FIVETRAN_DELETED
+	---+-------+------------------
+	1  | Alice | FALSE
+	2  | Bob   | TRUE
+	```
+	
+	So downstream users don't normally see Bob.
+	
+	---
+	
+	# 8. Why is this useful?
+	
+	Imagine someone accidentally deletes a customer.
+	
+	With a hard delete:
+	
+	```text
+	Customer 2
+	     ↓
+	DELETE
+	     ↓
+	gone
+	```
+	
+	You need another source/back-up to recover it.
+	
+	With a soft delete:
+	
+	```text
+	Customer 2
+	     ↓
+	_FIVETRAN_DELETED = TRUE
+	     ↓
+	hidden from normal queries
+	```
+	
+	The data is still physically present.
+	
+	You could potentially recover it by:
+	
+	```sql
+	UPDATE customer
+	SET _fivetran_deleted = FALSE
+	WHERE id = 2;
+	```
+	
+	Of course, whether this is appropriate depends on the source-of-truth and your CDC pipeline.
+	
+	---
+	
+	# 9. When should you use hard deletes?
+	
+	Sometimes keeping the data is **not allowed**.
+	
+	For example, imagine a regulatory/privacy requirement requiring actual removal of personal data.
+	
+	Then you may need:
+	
+	```sql
+	DELETE FROM customer
+	WHERE id = 2;
+	```
+	
+	rather than:
+	
+	```sql
+	UPDATE customer
+	SET _fivetran_deleted = TRUE
+	WHERE id = 2;
+	```
+	
+	So the decision is approximately:
+	
+	|Approach|What happens|Typical reason|
+	|---|---|---|
+	|Soft delete|Keep row + mark deleted|History/audit/recovery|
+	|Hard delete|Physically remove row|Compliance/storage/business requirement|
+	
+	---
+	
+	# 10. One important correction to the original answer
+	
+	The phrase:
+	
+	> "`_fivetran_deleted = true` is usually preferred"
+	
+	is a little too broad.
+	
+	I'd give a more interview-safe answer:
+	
+	> **"For deletes, the strategy depends on the business and compliance requirements. In many analytical pipelines, we preserve the record and represent the source deletion as a soft delete, for example with a CDC/deletion flag. If Fivetran is the ingestion tool, `_fivetran_deleted` is commonly used for this purpose. For cases where the data must actually be removed, we perform a hard delete."**
+	
+	That's more accurate because `_fivetran_deleted` is **Fivetran-specific**, not a Snowflake standard.
+	
+	---
+	
+	# 11. A complete CDC example
+	
+	Suppose your staging table receives:
+	
+	```text
+	ID | NAME    | OPERATION
+	---+---------+----------
+	1  | Alice   | U
+	3  | Charlie | D
+	4  | David   | I
+	```
+	
+	Your target currently contains:
+	
+	```text
+	ID | NAME
+	---+-------
+	1  | Alice
+	2  | Bob
+	3  | Charlie
+	```
+	
+	You can process the changes:
+	
+	```sql
+	MERGE INTO customer_target t
+	USING customer_staging s
+	ON t.id = s.id
+	
+	WHEN MATCHED AND s.operation = 'D'
+	    THEN DELETE
+	
+	WHEN MATCHED AND s.operation <> 'D'
+	    THEN UPDATE SET
+	        t.name = s.name
+	
+	WHEN NOT MATCHED AND s.operation <> 'D'
+	    THEN INSERT (id, name)
+	    VALUES (s.id, s.name);
+	```
+	
+	Result:
+	
+	```text
+	Before                 After
+	------                 -----
+	
+	1 Alice                1 Alice
+	2 Bob                  2 Bob
+	3 Charlie              4 David
+	                       3 deleted
+	```
+	
+	---
+	
+	# 12. The interview-level answer
+	
+	If they ask this in a **Senior Data Engineer interview**, I'd answer something like:
+	
+	> **"I would normally use CDC to capture inserts, updates, and deletes from the source database and land those changes in a Snowflake staging table. Then I'd use a `MERGE` against the target table. For an existing key, `WHEN MATCHED` updates the record; for a new key, `WHEN NOT MATCHED` inserts it.**
+	> 
+	> **For deletes, I would decide between soft and hard deletion based on the business and compliance requirements. For analytical workloads, we often preserve the record and mark it as deleted, which is useful for auditability and historical analysis. If Fivetran is being used, its `_fivetran_deleted` flag can be used to identify deleted records and downstream views can filter them out. If regulations or business requirements require physical removal, I would process the CDC delete as an actual `DELETE`.**
+	> 
+	> **I would also make the CDC process idempotent and ensure that the staging data is deduplicated or ordered appropriately, because multiple changes for the same key can arrive in one batch."**
+	
+	That **last sentence is particularly important for a senior-level answer**. CDC isn't just about knowing `MERGE`; you also need to think about **duplicate events, ordering, idempotency, late-arriving events, and schema changes**.
