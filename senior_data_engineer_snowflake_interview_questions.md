@@ -90,7 +90,7 @@ Use `MERGE` on a stable business key instead of blind `INSERT`. Persist the high
 Inserts/updates: `MERGE ... WHEN MATCHED THEN UPDATE ... WHEN NOT MATCHED THEN INSERT`. Deletes: soft-delete (`_fivetran_deleted[^1] = true`, filtered by downstream views) is usually preferred — it preserves history and is reversible. Hard delete (`WHEN MATCHED AND operation='D' THEN DELETE`) when storage or compliance requires actually removing the row.
 
 **7. Incremental load vs CDC vs full refresh.**
-Full refresh reloads everything every run — simplest and safest, but expensive at scale; good for small reference tables. Incremental pulls only rows changed since a watermark — cheaper, but blind to hard deletes and vulnerable to timestamp issues. CDC is log-based, captures every change including deletes, near-real-time — but adds load to the source and requires log retention to always exceed your maximum downtime.
+Full refresh reloads everything every run — simplest and safest, but expensive at scale; good for small reference tables. Incremental pulls only rows changed since a watermark — cheaper, but blind to hard deletes and vulnerable to timestamp issues. CDC is log-based, captures every change including deletes, near-real-time — but adds load to the source and requires log retention to always exceed your maximum downtime.[^2]
 
 **8. How would you recover a pipeline that has been failing for hours?**
 Diagnose first: is the failure upstream (source), in-flight (connector/Kafka), or downstream (Snowflake/transform)? Check whether source log/queue retention has already expired the missed window — if so, you may need a re-sync, not just a resume. Because loads should be idempotent, replay from the last good watermark in controlled batches (avoid overwhelming the warehouse), then reconcile row counts against source before declaring it resolved.
@@ -99,7 +99,7 @@ Diagnose first: is the failure upstream (source), in-flight (connector/Kafka), o
 Depends on the change. A new nullable column is usually safe and just flows into RAW. A type change or dropped/renamed column can silently corrupt downstream models or break the pipeline. Detect drift automatically, quarantine/pause the affected table rather than silently coercing data, and require human approval for anything that isn't clearly backward-compatible.
 
 **10. What is schema evolution, and how do you make it safe for consumers?**
-Define what counts as backward-compatible up front (adding nullable columns = safe; renaming/dropping/narrowing types = breaking). Enforce it with a data contract plus CI schema checks before deploy. For breaking changes, dual-write old and new fields during a deprecation window and notify consumers.
+Define what counts as backward-compatible up front (adding nullable columns = safe; renaming/dropping/narrowing types = breaking). Enforce it with a data contract plus CI schema checks before deploy. For breaking changes, dual-write old and new fields during a deprecation window and notify consumers.[^3]
 
 **11. Explain Snowflake's three architectural layers.**
 Storage — compressed, encrypted micro-partitions in cloud object storage, shared across all compute. Compute — independent virtual warehouses (MPP clusters) that read shared storage; spin up as many as needed without duplicating data. Cloud services — the coordination layer: query optimization, metadata, RBAC, transactions.
@@ -2301,3 +2301,1149 @@ _End of answered question bank._
 	> **I would also make the CDC process idempotent and ensure that the staging data is deduplicated or ordered appropriately, because multiple changes for the same key can arrive in one batch."**
 	
 	That **last sentence is particularly important for a senior-level answer**. CDC isn't just about knowing `MERGE`; you also need to think about **duplicate events, ordering, idempotency, late-arriving events, and schema changes**.
+
+[^2]: Yes. **A watermark is basically a checkpoint that tells your incremental pipeline: “I have already processed everything up to this point.”**
+	
+	### Simple example
+	
+	Suppose your source table has:
+	
+	|id|name|updated_at|
+	|---|---|---|
+	|1|Alice|10:00|
+	|2|Bob|10:05|
+	|3|Charlie|10:10|
+	|4|David|10:15|
+	
+	Your first incremental load runs at 10:20.
+	
+	You store:
+	
+	```text
+	watermark = 10:15
+	```
+	
+	On the next run, you query:
+	
+	```sql
+	SELECT *
+	FROM customer
+	WHERE updated_at > '10:15';
+	```
+	
+	Suppose these records changed afterward:
+	
+	|id|name|updated_at|
+	|---|---|---|
+	|5|Emma|10:20|
+	|6|Frank|10:25|
+	
+	Your pipeline loads them and then advances the watermark:
+	
+	```text
+	old watermark = 10:15
+	new watermark = 10:25
+	```
+	
+	So the next run does:
+	
+	```sql
+	WHERE updated_at > '10:25'
+	```
+	
+	---
+	
+	## Think of it like a bookmark
+	
+	Imagine reading a book:
+	
+	```text
+	Pages:
+	
+	1  2  3  4  5  6  7  8  9  10
+	                  ↑
+	             watermark
+	```
+	
+	You tell the pipeline:
+	
+	> "I've successfully processed everything through here."
+	
+	Next time, you continue from that point.
+	
+	---
+	
+	## What can be used as a watermark?
+	
+	Usually a column that increases or represents change time.
+	
+	### 1. Timestamp
+	
+	Most common:
+	
+	```sql
+	updated_at
+	```
+	
+	For example:
+	
+	```sql
+	SELECT *
+	FROM orders
+	WHERE updated_at > :last_watermark;
+	```
+	
+	The watermark might be:
+	
+	```text
+	2026-09-21 10:30:00
+	```
+	
+	### 2. Increasing ID
+	
+	If IDs are guaranteed to increase:
+	
+	```sql
+	WHERE id > :last_id
+	```
+	
+	For example:
+	
+	```text
+	last_id = 1,000,000
+	```
+	
+	Next load:
+	
+	```sql
+	WHERE id > 1,000,000
+	```
+	
+	But this only works for **new rows**. It doesn't detect:
+	
+	```text
+	UPDATE customer SET name = ...
+	```
+	
+	if the ID stays the same.
+	
+	---
+	
+	# Why does incremental loading have a problem with deletes?
+	
+	This is important for your interview.
+	
+	Suppose:
+	
+	```text
+	Source:
+	
+	ID | Name
+	---+-------
+	1  | Alice
+	2  | Bob
+	3  | Charlie
+	```
+	
+	Your Snowflake table has the same data.
+	
+	Then someone does:
+	
+	```sql
+	DELETE FROM customer
+	WHERE id = 2;
+	```
+	
+	Now the source is:
+	
+	```text
+	ID | Name
+	---+-------
+	1  | Alice
+	3  | Charlie
+	```
+	
+	But if your incremental query is:
+	
+	```sql
+	SELECT *
+	FROM customer
+	WHERE updated_at > :watermark;
+	```
+	
+	**where is Bob?**
+	
+	He's gone.
+	
+	There is no row that says:
+	
+	```text
+	ID = 2
+	operation = DELETE
+	```
+	
+	So your incremental process doesn't know that Bob was deleted.
+	
+	That's why the original statement says:
+	
+	> **"Incremental ... is blind to hard deletes."**
+	
+	CDC solves this because the database transaction log can contain an event such as:
+	
+	```text
+	ID = 2
+	OPERATION = DELETE
+	```
+	
+	---
+	
+	# Why are timestamp watermarks "vulnerable to timestamp issues"?
+	
+	This is another important interview point.
+	
+	Imagine your watermark is:
+	
+	```text
+	10:00:00
+	```
+	
+	At exactly the same time, two records are updated:
+	
+	```text
+	ID 10 → 10:00:00
+	ID 11 → 10:00:00
+	```
+	
+	If your pipeline uses:
+	
+	```sql
+	WHERE updated_at > '10:00:00'
+	```
+	
+	you could miss both records.
+	
+	A common technique is to use a small overlap:
+	
+	```sql
+	WHERE updated_at >= '09:59:55'
+	```
+	
+	and then **deduplicate** the results.
+	
+	Another robust approach is a composite watermark:
+	
+	```text
+	(updated_at, id)
+	```
+	
+	so that records with the same timestamp can still be ordered deterministically.
+	
+	---
+	
+	# Watermark vs CDC
+	
+	The easiest way to remember the difference:
+	
+	```text
+	INCREMENTAL LOAD
+	
+	Source table
+	     │
+	     │ WHERE updated_at > watermark
+	     ▼
+	Snowflake
+	
+	"I'll look for rows that appear to have changed."
+	```
+	
+	Whereas:
+	
+	```text
+	CDC
+	
+	Source database transaction log
+	             │
+	             │ INSERT
+	             │ UPDATE
+	             │ DELETE
+	             ▼
+	       Snowflake
+	
+	"Tell me every change that happened."
+	```
+	
+	### Example
+	
+	Source changes:
+	
+	```text
+	10:01 INSERT customer 5
+	10:02 UPDATE customer 2
+	10:03 DELETE customer 3
+	```
+	
+	Incremental timestamp approach may see:
+	
+	```text
+	customer 5
+	customer 2
+	```
+	
+	but potentially **cannot see the deletion of customer 3**.
+	
+	CDC sees:
+	
+	```text
+	INSERT  5
+	UPDATE  2
+	DELETE  3
+	```
+	
+	---
+	
+	## What does "log retention must exceed maximum downtime" mean?
+	
+	This is a very good interview concept.
+	
+	Suppose CDC reads PostgreSQL's transaction/WAL logs.
+	
+	Your CDC pipeline goes down for:
+	
+	```text
+	Monday 10:00
+	     ↓
+	pipeline crashes
+	     ↓
+	Tuesday 10:00
+	pipeline starts again
+	```
+	
+	If the source database retains its CDC logs for only **6 hours**, the changes from Monday may already have been removed.
+	
+	Then CDC cannot catch up.
+	
+	So you need:
+	
+	```text
+	CDC log retention
+	        >
+	maximum expected pipeline downtime
+	+
+	recovery margin
+	```
+	
+	For example:
+	
+	```text
+	Maximum expected outage = 24 hours
+	Safety margin           = 12 hours
+	
+	Required retention      > 36 hours
+	```
+	
+	This is why CDC isn't simply "turn it on and forget about it."
+	
+	---
+	
+	## Interview answer you can remember
+	
+	If they ask **"What is a watermark?"**, I'd say:
+	
+	> **"A watermark is a checkpoint representing the maximum source position that has been successfully processed by an incremental pipeline. It is commonly a timestamp such as `updated_at`, or sometimes an increasing ID. On the next run, we query records after that watermark, process them, and then advance the watermark. This avoids scanning the entire source table. However, timestamp-based incremental loading can miss hard deletes and can have boundary or precision issues, so we need strategies such as overlap windows and deduplication, or use CDC when we need reliable capture of inserts, updates, and deletes."**
+	
+	That's a strong **Senior Data Engineer** explanation.
+
+[^3]: Sure. This question is about **what happens when the structure of your data changes** and how you prevent that change from unexpectedly breaking dashboards, ETL jobs, applications, or other teams.
+	
+	---
+	
+	# 1. What is schema evolution?
+	
+	A **schema** describes the structure of a table.
+	
+	For example:
+	
+	```sql
+	CUSTOMER
+	-------------------------
+	id          BIGINT
+	name        VARCHAR
+	email       VARCHAR
+	created_at  TIMESTAMP
+	```
+	
+	Now imagine the source team changes the table.
+	
+	For example, they add:
+	
+	```sql
+	phone VARCHAR
+	```
+	
+	Now the schema becomes:
+	
+	```sql
+	CUSTOMER
+	-------------------------
+	id          BIGINT
+	name        VARCHAR
+	email       VARCHAR
+	phone       VARCHAR       <-- new
+	created_at  TIMESTAMP
+	```
+	
+	The process of changing the schema over time is called **schema evolution**.
+	
+	It happens frequently in data engineering:
+	
+	```text
+	Version 1
+	id
+	name
+	email
+	
+	       ↓
+	
+	Version 2
+	id
+	name
+	email
+	phone
+	
+	       ↓
+	
+	Version 3
+	id
+	name
+	email
+	phone
+	country
+	
+	       ↓
+	
+	Version 4
+	id
+	name
+	phone
+	country
+	```
+	
+	---
+	
+	# 2. Why can schema changes be dangerous?
+	
+	Because other systems may depend on the existing schema.
+	
+	Imagine your Snowflake table is:
+	
+	```text
+	customer
+	----------------
+	id
+	name
+	email
+	```
+	
+	And your BI dashboard runs:
+	
+	```sql
+	SELECT
+	    id,
+	    name,
+	    email
+	FROM customer;
+	```
+	
+	Adding `phone` doesn't hurt the query.
+	
+	But now imagine someone **renames**:
+	
+	```text
+	email
+	```
+	
+	to:
+	
+	```text
+	email_address
+	```
+	
+	The dashboard still executes:
+	
+	```sql
+	SELECT email FROM customer;
+	```
+	
+	and fails.
+	
+	So:
+	
+	```text
+	Schema change
+	      ↓
+	Consumer dependency
+	      ↓
+	Potential failure
+	```
+	
+	---
+	
+	# 3. Backward-compatible vs breaking changes
+	
+	This is the most important part of the interview question.
+	
+	You should define which changes are safe **before** people start changing schemas.
+	
+	### Usually backward-compatible
+	
+	Adding a nullable column:
+	
+	```sql
+	ALTER TABLE customer
+	ADD COLUMN phone VARCHAR;
+	```
+	
+	Existing consumers can continue doing:
+	
+	```sql
+	SELECT id, name, email
+	FROM customer;
+	```
+	
+	They don't care that `phone` exists.
+	
+	So:
+	
+	```text
+	ADD nullable column
+	        ↓
+	Existing consumers continue working
+	        ↓
+	Usually SAFE
+	```
+	
+	---
+	
+	# 4. What is a breaking change?
+	
+	A breaking change is one that can cause an existing consumer to fail or behave incorrectly.
+	
+	### Rename a column
+	
+	Before:
+	
+	```text
+	email
+	```
+	
+	After:
+	
+	```text
+	email_address
+	```
+	
+	Existing query:
+	
+	```sql
+	SELECT email
+	FROM customer;
+	```
+	
+	💥 Broken.
+	
+	---
+	
+	### Drop a column
+	
+	Before:
+	
+	```text
+	id
+	name
+	email
+	phone
+	```
+	
+	After:
+	
+	```text
+	id
+	name
+	email
+	```
+	
+	Any consumer using:
+	
+	```sql
+	SELECT phone
+	FROM customer;
+	```
+	
+	breaks.
+	
+	---
+	
+	### Narrow a data type
+	
+	Suppose:
+	
+	```text
+	amount DECIMAL(18,2)
+	```
+	
+	becomes:
+	
+	```text
+	amount INTEGER
+	```
+	
+	You potentially lose information.
+	
+	For example:
+	
+	```text
+	125.75
+	```
+	
+	can't safely be represented as an integer without changing the meaning.
+	
+	So type changes can be dangerous.
+	
+	---
+	
+	# 5. Why does the answer say "define what counts as backward-compatible up front"?
+	
+	Because you don't want every developer/team to make their own interpretation.
+	
+	You establish rules such as:
+	
+	```text
+	Allowed without consumer migration:
+	------------------------------------
+	✓ Add nullable column
+	✓ Add optional metadata
+	✓ Add new table
+	
+	Requires review/migration:
+	------------------------------------
+	⚠ Rename column
+	⚠ Drop column
+	⚠ Change data type
+	⚠ Change meaning of existing field
+	⚠ Make nullable column NOT NULL
+	```
+	
+	Then everyone knows the rules.
+	
+	---
+	
+	# 6. What is a data contract?
+	
+	A **data contract** is an agreed definition of what a producer promises to provide to consumers.
+	
+	For example:
+	
+	```text
+	Customer Data Contract
+	--------------------------------
+	id
+	  type: BIGINT
+	  required: yes
+	
+	name
+	  type: VARCHAR
+	  required: yes
+	
+	email
+	  type: VARCHAR
+	  required: no
+	
+	created_at
+	  type: TIMESTAMP
+	  required: yes
+	```
+	
+	The contract can also define things like:
+	
+	```text
+	Allowed values
+	Nullability
+	Data types
+	Field meaning
+	Update frequency
+	Ownership
+	SLA
+	Schema version
+	```
+	
+	Think of it as an **API contract**, but for data.
+	
+	---
+	
+	# 7. Data contract is very similar to an API contract
+	
+	As a Java developer, this analogy is useful.
+	
+	Imagine your REST API has:
+	
+	```json
+	{
+	  "id": 123,
+	  "name": "Alice",
+	  "email": "alice@example.com"
+	}
+	```
+	
+	Adding:
+	
+	```json
+	{
+	  "id": 123,
+	  "name": "Alice",
+	  "email": "alice@example.com",
+	  "phone": "12345"
+	}
+	```
+	
+	is generally backward-compatible because old clients can ignore `phone`.
+	
+	But changing:
+	
+	```json
+	"email"
+	```
+	
+	to:
+	
+	```json
+	"emailAddress"
+	```
+	
+	can break clients.
+	
+	Data contracts apply the same idea to data pipelines.
+	
+	---
+	
+	# 8. What does "CI schema checks" mean?
+	
+	CI means **Continuous Integration**.
+	
+	Suppose a developer creates this change:
+	
+	```text
+	Before:
+	
+	customer
+	---------
+	id
+	name
+	email
+	```
+	
+	They submit a PR that changes:
+	
+	```text
+	customer
+	---------
+	id
+	name
+	email_address
+	```
+	
+	Your CI pipeline can detect:
+	
+	```text
+	email → email_address
+	```
+	
+	and say:
+	
+	```text
+	❌ Breaking schema change detected.
+	Consumer migration required.
+	```
+	
+	The deployment doesn't proceed until the change is reviewed.
+	
+	Conceptually:
+	
+	```text
+	Developer PR
+	     │
+	     ▼
+	Schema diff
+	     │
+	     ├── Add nullable column
+	     │        ↓
+	     │      PASS
+	     │
+	     └── Rename/drop/type change
+	              ↓
+	           FAIL / REVIEW
+	```
+	
+	---
+	
+	# 9. What is a schema diff?
+	
+	It's simply comparing:
+	
+	```text
+	Old schema
+	```
+	
+	against:
+	
+	```text
+	New schema
+	```
+	
+	For example:
+	
+	```text
+	OLD                         NEW
+	
+	id BIGINT                   id BIGINT
+	name VARCHAR                name VARCHAR
+	email VARCHAR               email_address VARCHAR
+	                            phone VARCHAR
+	```
+	
+	The system detects:
+	
+	```text
+	RENAME:
+	email → email_address
+	
+	ADD:
+	phone VARCHAR
+	```
+	
+	The `phone` addition might be acceptable.
+	
+	The rename needs special handling.
+	
+	---
+	
+	# 10. What does "dual-write" mean?
+	
+	This is the most important part of the last sentence.
+	
+	Suppose you currently have:
+	
+	```text
+	email
+	```
+	
+	but you want to replace it with:
+	
+	```text
+	email_address
+	```
+	
+	You **don't immediately remove `email`**.
+	
+	Instead, for a period of time, you populate both:
+	
+	```text
+	email             email_address
+	-------------------------------
+	alice@example.com alice@example.com
+	bob@example.com   bob@example.com
+	```
+	
+	This is called **dual-writing**.
+	
+	During this period:
+	
+	```text
+	                 ┌── email
+	Source ──────────┤
+	                 └── email_address
+	```
+	
+	Old consumers continue using:
+	
+	```sql
+	SELECT email
+	FROM customer;
+	```
+	
+	New consumers can use:
+	
+	```sql
+	SELECT email_address
+	FROM customer;
+	```
+	
+	---
+	
+	# 11. Then migrate consumers
+	
+	Suppose you have three consumers:
+	
+	```text
+	Consumer A → email
+	Consumer B → email
+	Consumer C → email_address
+	```
+	
+	You gradually migrate:
+	
+	```text
+	Week 1:
+	
+	A → email
+	B → email
+	C → email_address
+	
+	Week 2:
+	
+	A → email_address
+	B → email
+	C → email_address
+	
+	Week 3:
+	
+	A → email_address
+	B → email_address
+	C → email_address
+	```
+	
+	Now nobody depends on:
+	
+	```text
+	email
+	```
+	
+	So you can eventually remove it.
+	
+	```text
+	email
+	  ↓
+	deprecated
+	  ↓
+	migration period
+	  ↓
+	removed
+	```
+	
+	This is the **deprecation window**.
+	
+	---
+	
+	# 12. Why notify consumers?
+	
+	Because you may not even know all the consumers.
+	
+	Your Snowflake table could be used by:
+	
+	```text
+	                    ┌── Power BI
+	                    │
+	Customer table ─────┼── dbt model
+	                    │
+	                    ├── ML pipeline
+	                    │
+	                    ├── Finance report
+	                    │
+	                    └── Another team's API
+	```
+	
+	If you silently rename a column, somebody's pipeline could fail tomorrow morning.
+	
+	So you communicate:
+	
+	> `customer.email` will be deprecated on October 1. Please migrate to `customer.email_address`. Both fields will be available until November 1.
+	
+	That gives consumers time to migrate.
+	
+	---
+	
+	# 13. One subtle point: adding a column isn't ALWAYS safe
+	
+	The interview answer says:
+	
+	> "adding nullable columns = safe"
+	
+	That's generally true for **additive schema evolution**, but there are exceptions.
+	
+	For example, a consumer might do:
+	
+	```sql
+	SELECT *
+	FROM customer;
+	```
+	
+	and expect exactly 3 columns.
+	
+	Adding a fourth column could potentially affect:
+	
+	- CSV exports
+	    
+	- positional mappings
+	    
+	- `INSERT INTO ... SELECT *`
+	    
+	- downstream ETL
+	    
+	- applications expecting a fixed schema
+	    
+	
+	So I'd say:
+	
+	> **"Adding a nullable column is generally backward-compatible, assuming consumers don't depend on an exact column set or positional schema."**
+	
+	That's a more senior answer.
+	
+	---
+	
+	# 14. A complete real-world example
+	
+	Imagine you're building a Snowflake pipeline:
+	
+	```text
+	PostgreSQL
+	    │
+	    │ CDC
+	    ▼
+	Snowflake RAW
+	    │
+	    ▼
+	Snowflake STAGING
+	    │
+	    ▼
+	Snowflake ANALYTICS
+	    │
+	    ├── Power BI
+	    ├── Finance reports
+	    └── ML pipeline
+	```
+	
+	Current schema:
+	
+	```text
+	customer
+	---------
+	id
+	name
+	email
+	```
+	
+	Business wants:
+	
+	```text
+	email → email_address
+	```
+	
+	### ❌ Bad approach
+	
+	Immediately rename:
+	
+	```text
+	email
+	     ↓
+	email_address
+	```
+	
+	Result:
+	
+	```text
+	Power BI       💥
+	Finance ETL    💥
+	ML pipeline    💥
+	```
+	
+	---
+	
+	### ✅ Safer approach
+	
+	**Step 1 — Add new field**
+	
+	```text
+	id
+	name
+	email
+	email_address
+	```
+	
+	**Step 2 — Populate both**
+	
+	```text
+	email             email_address
+	--------------------------------
+	a@test.com        a@test.com
+	b@test.com        b@test.com
+	```
+	
+	**Step 3 — Notify consumers**
+	
+	```text
+	email is deprecated.
+	Use email_address.
+	Migration deadline: November 1.
+	```
+	
+	**Step 4 — CI prevents new consumers from using `email`**
+	
+	**Step 5 — Migrate existing consumers**
+	
+	```text
+	Power BI → email_address
+	Finance  → email_address
+	ML       → email_address
+	```
+	
+	**Step 6 — Verify nobody uses `email`**
+	
+	**Step 7 — Remove old column**
+	
+	```text
+	id
+	name
+	email_address
+	```
+	
+	This is a controlled schema evolution process.
+	
+	---
+	
+	# 15. Interview answer
+	
+	A strong answer for your interview would be:
+	
+	> **"Schema evolution means changing the structure of a dataset over time—for example adding, removing, renaming, or changing columns. I first define backward-compatible changes in a data contract. Adding an optional nullable column is generally safe, while renaming or dropping columns, changing types incompatibly, or changing the meaning of an existing field can be breaking changes.**
+	> 
+	> **I would enforce the contract through schema validation in CI so breaking changes are detected before deployment. For a breaking change, I wouldn't immediately remove the old field. I'd typically introduce the new field, dual-write both fields during a deprecation period, notify and migrate downstream consumers, and then remove the old field after verifying that it is no longer being used."**
+	
+	### The mental model
+	
+	Remember it as:
+	
+	```text
+	Schema change
+	      │
+	      ▼
+	Is it backward compatible?
+	      │
+	   ┌──┴──┐
+	  YES    NO
+	   │      │
+	   ▼      ▼
+	CI pass  Migration plan
+	          │
+	          ▼
+	       Dual-write
+	          │
+	          ▼
+	       Notify users
+	          │
+	          ▼
+	      Migrate consumers
+	          │
+	          ▼
+	       Remove old field
+	```
+	
+	For a **Senior Data Engineer**, the key idea is not just knowing what schema evolution means. It's demonstrating that you understand **consumer impact, contracts, automated validation, backward compatibility, and controlled migrations**.
