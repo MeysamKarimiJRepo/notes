@@ -102,7 +102,7 @@ Depends on the change. A new nullable column is usually safe and just flows into
 Define what counts as backward-compatible up front (adding nullable columns = safe; renaming/dropping/narrowing types = breaking). Enforce it with a data contract plus CI schema checks before deploy. For breaking changes, dual-write old and new fields during a deprecation window and notify consumers.[^3]
 
 **11. Explain Snowflake's three architectural layers.**
-Storage — compressed, encrypted micro-partitions in cloud object storage, shared across all compute. Compute — independent virtual warehouses (MPP clusters) that read shared storage; spin up as many as needed without duplicating data. Cloud services — the coordination layer: query optimization, metadata, RBAC, transactions.
+Storage — compressed, encrypted micro-partitions in cloud object storage, shared across all compute. Compute — independent virtual warehouses (MPP clusters) that read shared storage; spin up as many as needed without duplicating data. Cloud services — the coordination layer: query optimization, metadata, RBAC, transactions.[^4]
 
 **12. What is a virtual warehouse, and how do you choose its size?**
 An independent compute cluster (XS–6XL, compute doubles each size up) reading shared storage. Size for the workload's actual bottleneck — many performance problems are concurrency, not raw compute, and are better solved with multi-cluster warehouses than bigger ones. Start small, check Query Profile, scale only if a query is genuinely compute/spill-bound.
@@ -3447,3 +3447,648 @@ _End of answered question bank._
 	```
 	
 	For a **Senior Data Engineer**, the key idea is not just knowing what schema evolution means. It's demonstrating that you understand **consumer impact, contracts, automated validation, backward compatibility, and controlled migrations**.
+
+[^4]: Yes. This is a **very important Snowflake architecture question**, especially for a Senior Data Engineer interview.
+	
+	The easiest way to understand it is:
+	
+	```text
+	                 Snowflake
+	                     │
+	        ┌────────────┼────────────┐
+	        │            │            │
+	        ▼            ▼            ▼
+	     Storage      Compute      Cloud Services
+	        │            │            │
+	        │            │            ├─ Query optimization
+	        │            │            ├─ Metadata
+	        │            │            ├─ Authentication/RBAC
+	        │            │            ├─ Transaction management
+	        │            │            └─ Coordination
+	        │            │
+	        │            ├─ Warehouse A
+	        │            ├─ Warehouse B
+	        │            └─ Warehouse C
+	        │
+	        └─ Micro-partitions
+	           Cloud object storage
+	```
+	
+	The **big idea** is:
+	
+	> **Storage and compute are separated.**
+	
+	That is one of the most important things to understand about Snowflake.
+	
+	---
+	
+	# 1. Storage layer
+	
+	Your data ultimately lives in Snowflake's storage layer.
+	
+	Snowflake automatically organizes table data into **micro-partitions**.
+	
+	For example, imagine you have:
+	
+	```sql
+	CUSTOMER
+	-------------------------
+	ID
+	NAME
+	COUNTRY
+	CREATED_AT
+	```
+	
+	with 500 million rows.
+	
+	You don't have one enormous file like:
+	
+	```text
+	customer.csv
+	```
+	
+	Instead, Snowflake automatically organizes the data into many immutable micro-partitions:
+	
+	```text
+	CUSTOMER
+	   │
+	   ├── Micro-partition 1
+	   ├── Micro-partition 2
+	   ├── Micro-partition 3
+	   ├── Micro-partition 4
+	   ├── ...
+	   └── Micro-partition N
+	```
+	
+	These are stored in Snowflake-managed cloud storage.
+	
+	Snowflake handles things such as:
+	
+	- compression
+	    
+	- encryption
+	    
+	- storage management
+	    
+	- partition metadata
+	    
+	
+	You generally don't manually create or manage these micro-partitions.
+	
+	---
+	
+	# 2. Why are micro-partitions important?
+	
+	Because Snowflake can use metadata to avoid reading unnecessary data.
+	
+	Suppose:
+	
+	```sql
+	SELECT *
+	FROM orders
+	WHERE order_date = '2026-09-21';
+	```
+	
+	Imagine your table has data from:
+	
+	```text
+	2020 → 2026
+	```
+	
+	Snowflake knows metadata about the micro-partitions.
+	
+	For example:
+	
+	```text
+	Micro-partition     Min date       Max date
+	------------------------------------------------
+	MP1                 2020-01-01     2020-12-31
+	MP2                 2021-01-01     2021-12-31
+	MP3                 2022-01-01     2022-12-31
+	...
+	MP7                 2026-01-01     2026-09-30
+	```
+	
+	For:
+	
+	```sql
+	WHERE order_date = '2026-09-21'
+	```
+	
+	Snowflake can potentially skip:
+	
+	```text
+	MP1
+	MP2
+	MP3
+	MP4
+	MP5
+	MP6
+	```
+	
+	and read only relevant partitions.
+	
+	This is called **micro-partition pruning**.
+	
+	So you can think:
+	
+	```text
+	Query
+	  │
+	  ▼
+	Metadata
+	  │
+	  ├── MP1 → SKIP
+	  ├── MP2 → SKIP
+	  ├── MP3 → SKIP
+	  └── MP7 → READ
+	```
+	
+	This is one reason good filtering can make a huge difference in Snowflake performance.
+	
+	---
+	
+	# 3. Compute layer
+	
+	Now we get to **virtual warehouses**.
+	
+	A warehouse is basically a collection of compute resources used to execute queries.
+	
+	For example:
+	
+	```text
+	Warehouse SMALL
+	     │
+	     ├── Compute node
+	     ├── Compute node
+	     └── Compute node
+	```
+	
+	A larger warehouse provides more compute resources.
+	
+	For example:
+	
+	```text
+	X-Small
+	Small
+	Medium
+	Large
+	X-Large
+	...
+	```
+	
+	The exact resource allocation depends on Snowflake's warehouse configuration.
+	
+	---
+	
+	# 4. The important thing: compute is separate from storage
+	
+	This is the fundamental Snowflake architecture.
+	
+	Imagine:
+	
+	```text
+	                 Shared Storage
+	              ┌─────────────────┐
+	              │ Micro-partitions │
+	              │ Micro-partitions │
+	              │ Micro-partitions │
+	              └─────────────────┘
+	                  ▲     ▲     ▲
+	                  │     │     │
+	             ┌────┘     │     └────┐
+	             │          │          │
+	        Warehouse A Warehouse B Warehouse C
+	```
+	
+	All three warehouses can access the **same underlying data**.
+	
+	You don't have:
+	
+	```text
+	Warehouse A → copy of data
+	Warehouse B → another copy
+	Warehouse C → another copy
+	```
+	
+	Instead:
+	
+	```text
+	                 SAME DATA
+	                     │
+	          ┌──────────┼──────────┐
+	          ▼          ▼          ▼
+	       WH A       WH B       WH C
+	```
+	
+	This is the foundation of Snowflake's workload isolation.
+	
+	---
+	
+	# 5. Why is this useful?
+	
+	Imagine you have:
+	
+	```text
+	Warehouse A
+	    ↓
+	ETL jobs
+	
+	Warehouse B
+	    ↓
+	BI dashboards
+	
+	Warehouse C
+	    ↓
+	Data science
+	```
+	
+	They can operate independently.
+	
+	A heavy ETL workload on Warehouse A doesn't necessarily have to consume the compute capacity of Warehouse B.
+	
+	That's extremely useful in an enterprise data platform.
+	
+	For example:
+	
+	```text
+	                    Snowflake Storage
+	                          │
+	             ┌────────────┼────────────┐
+	             ▼            ▼            ▼
+	          ETL WH        BI WH       ML WH
+	             │            │            │
+	         pipelines     dashboards   notebooks
+	```
+	
+	---
+	
+	# 6. Can you have multiple warehouses?
+	
+	Yes.
+	
+	This is a major Snowflake concept.
+	
+	For example:
+	
+	```text
+	RAW_LOAD_WH
+	ANALYTICS_WH
+	BI_WH
+	DATA_SCIENCE_WH
+	```
+	
+	Each can have its own:
+	
+	- size
+	    
+	- auto-suspend
+	    
+	- auto-resume
+	    
+	- scaling configuration
+	    
+	- workload
+	    
+	
+	And they can access the same Snowflake data.
+	
+	---
+	
+	# 7. What does "spin up as many as needed" mean?
+	
+	Be slightly careful with that wording.
+	
+	It doesn't mean:
+	
+	> "Unlimited warehouses for free."
+	
+	You can create multiple independent warehouses, subject to your Snowflake account, configuration, and cost.
+	
+	The architectural point is:
+	
+	> **Adding compute doesn't require copying the underlying data.**
+	
+	For example:
+	
+	```text
+	Storage = 100 TB
+	
+	Warehouse A
+	Warehouse B
+	Warehouse C
+	```
+	
+	You don't need:
+	
+	```text
+	100 TB × 3
+	```
+	
+	just because you have three warehouses.
+	
+	The warehouses use the shared storage.
+	
+	---
+	
+	# 8. Cloud Services layer
+	
+	This is the layer many candidates forget.
+	
+	The Cloud Services layer handles the **coordination and control-plane functionality** around queries and data access.
+	
+	Conceptually:
+	
+	```text
+	             Cloud Services
+	                    │
+	        ┌───────────┼────────────┐
+	        │           │            │
+	     Metadata     Security     Query
+	                               optimization
+	        │           │            │
+	        └───────────┼────────────┘
+	                    │
+	                    ▼
+	                Compute
+	                    │
+	                    ▼
+	                Storage
+	```
+	
+	Examples include:
+	
+	### Query parsing and optimization
+	
+	When you send:
+	
+	```sql
+	SELECT *
+	FROM orders
+	WHERE customer_id = 123;
+	```
+	
+	Snowflake needs to:
+	
+	1. Parse SQL
+	    
+	2. Understand the query
+	    
+	3. Build/optimize the execution plan
+	    
+	4. Determine which data needs to be accessed
+	    
+	5. Coordinate execution
+	    
+	
+	---
+	
+	### Metadata
+	
+	Snowflake maintains metadata about objects and storage.
+	
+	For example:
+	
+	```text
+	Table
+	 ↓
+	Micro-partitions
+	 ↓
+	Metadata about partitions
+	 ↓
+	Min/max values, statistics, etc.
+	```
+	
+	This information helps with things such as partition pruning and query optimization.
+	
+	---
+	
+	### Authentication and authorization
+	
+	For example:
+	
+	```sql
+	GRANT SELECT
+	ON TABLE orders
+	TO ROLE analyst;
+	```
+	
+	The security/authorization mechanisms determine whether the requesting role can access the object.
+	
+	---
+	
+	### Transaction management
+	
+	For example:
+	
+	```sql
+	BEGIN;
+	
+	UPDATE account
+	SET balance = balance - 100
+	WHERE id = 1;
+	
+	UPDATE account
+	SET balance = balance + 100
+	WHERE id = 2;
+	
+	COMMIT;
+	```
+	
+	Snowflake needs to coordinate transactional behavior.
+	
+	---
+	
+	# 9. Put the three layers together
+	
+	Suppose you execute:
+	
+	```sql
+	SELECT SUM(amount)
+	FROM payments
+	WHERE payment_date >= '2026-09-01';
+	```
+	
+	Conceptually:
+	
+	### Step 1 — Cloud Services
+	
+	```text
+	SQL
+	 ↓
+	Parse
+	 ↓
+	Optimize
+	 ↓
+	Determine what data is relevant
+	```
+	
+	### Step 2 — Compute
+	
+	The virtual warehouse executes the query:
+	
+	```text
+	Warehouse
+	   │
+	   ├── Worker
+	   ├── Worker
+	   ├── Worker
+	   └── Worker
+	```
+	
+	### Step 3 — Storage
+	
+	The compute nodes read the relevant micro-partitions:
+	
+	```text
+	Storage
+	
+	MP1 → skip
+	MP2 → skip
+	MP3 → read
+	MP4 → read
+	MP5 → read
+	...
+	```
+	
+	Then compute performs the aggregation:
+	
+	```text
+	SUM(amount)
+	```
+	
+	and returns the result.
+	
+	---
+	
+	# 10. Why is this architecture powerful?
+	
+	The major advantage is **separation of storage and compute**.
+	
+	Traditional database architecture often looks more like:
+	
+	```text
+	Database server
+	 ├── CPU
+	 ├── RAM
+	 ├── Disk
+	 └── Database
+	```
+	
+	If you need more compute, you may need to scale the whole database system.
+	
+	Snowflake conceptually separates them:
+	
+	```text
+	             Storage
+	                │
+	      ┌─────────┼─────────┐
+	      │         │         │
+	   Compute   Compute   Compute
+	      A         B         C
+	```
+	
+	So you can scale compute for a particular workload without duplicating the data.
+	
+	---
+	
+	# 11. One important nuance about "MPP"
+	
+	Your original answer says:
+	
+	> "Compute — independent virtual warehouses (MPP clusters)"
+	
+	This is broadly useful interview language.
+	
+	**MPP = Massively Parallel Processing.**
+	
+	Instead of one machine processing:
+	
+	```text
+	1 billion rows
+	```
+	
+	multiple compute nodes can process different portions in parallel:
+	
+	```text
+	                 1 billion rows
+	                       │
+	          ┌────────────┼────────────┐
+	          ▼            ▼            ▼
+	       Worker 1     Worker 2     Worker 3
+	       333M rows    333M rows    334M rows
+	          │            │            │
+	          └────────────┼────────────┘
+	                       ▼
+	                    Result
+	```
+	
+	That's the parallel processing aspect.
+	
+	---
+	
+	# 12. A useful interview analogy
+	
+	Think of a restaurant.
+	
+	### Storage = warehouse
+	
+	All ingredients are stored in one central place.
+	
+	```text
+	             Food Storage
+	                  │
+	          ┌───────┼───────┐
+	          ▼       ▼       ▼
+	       Kitchen A Kitchen B Kitchen C
+	```
+	
+	### Compute = kitchens
+	
+	Different kitchens can prepare different orders using the same underlying ingredients.
+	
+	### Cloud Services = management
+	
+	Management handles:
+	
+	- who is allowed to order
+	    
+	- what the order means
+	    
+	- which kitchen should handle it
+	    
+	- coordination
+	    
+	- metadata/inventory
+	    
+	
+	So Snowflake isn't simply:
+	
+	> "A database in the cloud."
+	
+	The important architecture is:
+	
+	```text
+	       ┌─────────────────────────────┐
+	       │       Cloud Services        │
+	       │  Security / Metadata / SQL  │
+	       │       Optimization          │
+	       └─────────────┬───────────────┘
+	                     │
+	       ┌─────────────┴───────────────┐
+	       │          Compute            │
+	       │   Virtual Warehouses / MPP  │
+	       └─────────────┬───────────────┘
+	                     │
+	       ┌─────────────┴───────────────┐
+	       │           Storage           │
+	       │  Compressed Micro-partitions│
+	       │      Cloud Object Storage   │
+	       └─────────────────────────────┘
+	```
+	
+	### Interview answer
+	
+	> **"Snowflake separates storage, compute, and cloud services. Storage contains compressed and encrypted data organized into micro-partitions in cloud storage. Compute is provided by independent virtual warehouses that use MPP to process data and can access the same shared storage, which allows workloads to be isolated and compute to scale independently of storage. The Cloud Services layer provides the control and coordination functions, including SQL parsing and optimization, metadata management, authentication and authorization, and transaction coordination. The key architectural benefit is that compute can be scaled or isolated without having to duplicate the underlying data."**
+	
+	If you're preparing for a **Senior Data Engineer interview**, I'd particularly memorize the phrase **"separation of storage and compute"** and be ready to explain **why multiple warehouses can access the same data without copying it**.
