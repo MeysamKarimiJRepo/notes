@@ -179,7 +179,7 @@ Clients
 **پاسخ:** پیام‌هایی که بارها پردازش‌شان با خطا مواجه می‌شود (مثلاً بعد از retry با exponential backoff)، به یک Dead Letter Topic/Queue منتقل می‌شوند تا از blocking شدن کل consumer جلوگیری شود. سپس این پیام‌ها می‌توانند به‌صورت جداگانه بررسی یا reprocess شوند.
 
 **سوال:** backpressure چیست و چطور آن را در یک سیستم reactive Java (Project Reactor، RxJava) پیاده‌سازی می‌کنید؟
-**پاسخ:** Backpressure مکانیزمی است که به consumer اجازه می‌دهد نرخ داده دریافتی از producer را کنترل کند تا از overwhelm شدن جلوگیری شود. در Project Reactor با Reactive Streams API، subscriber می‌تواند از طریق `request(n)` تعداد item مورد نیاز را اعلام کند و همچنین با عملگرهایی مثل `onBackpressureBuffer` یا `onBackpressureDrop` رفتار در صورت overflow را کنترل کرد.
+**پاسخ:** Backpressure مکانیزمی است که به consumer اجازه می‌دهد نرخ داده دریافتی از producer را کنترل کند تا از overwhelm شدن جلوگیری شود. در Project Reactor با Reactive Streams API، subscriber می‌تواند از طریق `request(n)` تعداد item مورد نیاز را اعلام کند و همچنین با عملگرهایی مثل `onBackpressureBuffer` یا `onBackpressureDrop` رفتار در صورت overflow را کنترل کرد.[^17]
 
 ---
 
@@ -7780,3 +7780,475 @@ Trade-offها:
 	Consumer Down   -> Consumer Lag / Backlog
 	Schema Changes  -> Backward Compatibility / Event Versioning
 	```
+
+[^17]: حتماً. برای مصاحبه Senior Java بهتر است Backpressure را فقط به‌صورت تعریف حفظ نکنی؛ باید بتوانی **با یک مثال ساده توضیح بدهی که چه مشکلی را حل می‌کند و `request(n)` دقیقاً چه کاری انجام می‌دهد.**
+	
+	## 1. مسئله چیست؟
+	
+	فرض کن یک Producer خیلی سریع داده تولید می‌کند:
+	
+	```
+	Producer  --->  Consumer
+	 1000 msg/s       100 msg/s
+	```
+	
+	Producer در هر ثانیه **1000 پیام** می‌فرستد، ولی Consumer فقط می‌تواند **100 پیام** پردازش کند.
+	
+	اگر مکانیزمی برای کنترل وجود نداشته باشد:
+	
+	```
+	1000 msg/s ---> [ Queue / Memory ] ---> 100 msg/s
+	                    ↑
+	                 grows...
+	```
+	
+	صف مرتباً بزرگ‌تر می‌شود و در نهایت ممکن است:
+	
+	- Memory زیاد مصرف شود
+	- GC شدید شود
+	- latency افزایش پیدا کند
+	- و در نهایت `OutOfMemoryError` رخ دهد.
+	
+	**Backpressure یعنی Consumer بتواند به Producer بگوید:**
+	
+	> «فعلاً فقط 10 تا داده برای من بفرست؛ وقتی پردازش کردم، دوباره درخواست می‌کنم.»
+	
+	---
+	
+	# 2. `request(n)` دقیقاً چیست؟
+	
+	در Reactive Streams، Subscriber یک متد مهم دارد:
+	
+	```
+	Subscription.request(long n)
+	```
+	
+	مثلاً:
+	
+	```
+	subscription.request(10);
+	```
+	
+	یعنی:
+	
+	> من آمادگی دریافت حداکثر 10 item را دارم.
+	
+	این نکته مهم است:
+	
+	**`request(10)` به معنی "دقیقاً 10 تا بفرست" نیست؛ یعنی Subscriber ظرفیت پردازش 10 item را اعلام کرده است.**
+	
+	جریان کلی:
+	
+	```
+	             request(10)
+	Subscriber <---------------- Producer
+	     |
+	     |  process
+	     |
+	     +---- request(10)
+	```
+	
+	بنابراین سرعت مصرف‌کننده می‌تواند روی سرعت ارسال upstream اثر بگذارد.
+	
+	---
+	
+	# 3. مثال خیلی ساده با Reactor
+	
+	در Project Reactor می‌توانیم چنین چیزی داشته باشیم:
+	
+	```
+	Flux<Integer> numbers =
+	        Flux.range(1, 1000);
+	
+	numbers
+	    .subscribe(
+	        item -> {
+	            System.out.println("Processing " + item);
+	        }
+	    );
+	```
+	
+	در این حالت Reactor خودش مکانیزم Reactive Streams را مدیریت می‌کند.
+	
+	اما برای اینکه مفهوم `request(n)` را ببینی، می‌توانیم Subscriber سفارشی بنویسیم:
+	
+	```
+	Flux.range(1, 100)
+	    .subscribe(new BaseSubscriber<>() {
+	
+	        @Override
+	        protected void hookOnSubscribe(Subscription subscription) {
+	            request(10);
+	        }
+	
+	        @Override
+	        protected void hookOnNext(Integer value) {
+	            System.out.println("Processing: " + value);
+	
+	            // بعد از پردازش هر item،
+	            // یک item دیگر درخواست کن
+	            request(1);
+	        }
+	    });
+	```
+	
+	اینجا چه اتفاقی می‌افتد؟
+	
+	ابتدا:
+	
+	```
+	request(10);
+	```
+	
+	یعنی:
+	
+	```
+	"من 10 تا item ظرفیت دارم"
+	```
+	
+	بعد مثلاً item اول آمد:
+	
+	```
+	1
+	```
+	
+	پردازش شد و دوباره:
+	
+	```
+	request(1);
+	```
+	
+	یعنی:
+	
+	```
+	"حالا یک ظرفیت جدید دارم."
+	```
+	
+	پس یک جریان کنترل بین Consumer و Producer ایجاد می‌شود.
+	
+	---
+	
+	# 4. اما `onBackpressureBuffer` چیست؟
+	
+	فرض کن Producer بسیار سریع است و Consumer نمی‌تواند به همان سرعت مصرف کند.
+	
+	می‌توانیم بگوییم:
+	
+	```
+	Flux<Integer> flux =
+	        Flux.range(1, 1_000_000)
+	            .onBackpressureBuffer();
+	```
+	
+	در این حالت اگر Consumer عقب بیفتد، Reactor می‌تواند داده‌ها را در buffer نگه دارد.
+	
+	تصویر ذهنی:
+	
+	```
+	Producer
+	   |
+	   | 1000 msg/s
+	   v
+	+----------------+
+	|    BUFFER      |
+	|  1 2 3 4 5...  |
+	+----------------+
+	        |
+	        | 100 msg/s
+	        v
+	     Consumer
+	```
+	
+	مزیت:
+	
+	- داده‌ها را drop نمی‌کنیم.
+	
+	ولی مشکل:
+	
+	> اگر Producer برای مدت طولانی سریع‌تر باشد، Buffer می‌تواند بیش از حد رشد کند.
+	
+	بنابراین این کار خطرناک است:
+	
+	```
+	.onBackpressureBuffer()
+	```
+	
+	بدون محدودیت.
+	
+	بهتر است مثلاً:
+	
+	```
+	.onBackpressureBuffer(
+	    1000,
+	    dropped -> System.out.println("Dropped: " + dropped)
+	);
+	```
+	
+	یعنی buffer حداکثر 1000 item داشته باشد.
+	
+	---
+	
+	# 5. `onBackpressureDrop`
+	
+	گاهی **از دست دادن بعضی داده‌ها قابل قبول است**.
+	
+	مثلاً:
+	
+	```
+	Real-time sensor data
+	CPU metrics
+	Mouse movements
+	Telemetry
+	```
+	
+	اگر Consumer عقب افتاد، ممکن است نخواهیم تمام داده‌های قدیمی را نگه داریم.
+	
+	می‌توانیم بگوییم:
+	
+	```
+	Flux.interval(Duration.ofMillis(1))
+	    .onBackpressureDrop(
+	        item -> System.out.println("Dropped: " + item)
+	    )
+	    .subscribe(item -> {
+	        // slow processing
+	    });
+	```
+	
+	یعنی:
+	
+	```
+	Producer
+	  |
+	  | 1000 events/sec
+	  v
+	Consumer
+	  |
+	  | only 100 events/sec
+	  v
+	Some events are dropped
+	```
+	
+	---
+	
+	# 6. چند Strategy مهم
+	
+	در Reactor چند strategy متداول داریم:
+	
+	### Buffer
+	
+	```
+	.onBackpressureBuffer()
+	```
+	
+	یعنی:
+	
+	> فعلاً داده‌ها را نگه دار.
+	
+	مناسب وقتی که **از دست دادن داده unacceptable** است و حجم backlog قابل کنترل است.
+	
+	---
+	
+	### Drop
+	
+	```
+	.onBackpressureDrop()
+	```
+	
+	یعنی:
+	
+	> اگر Consumer عقب افتاد، داده‌های جدید را drop کن.
+	
+	مناسب برای داده‌هایی که **همه‌شان ضروری نیستند**.
+	
+	---
+	
+	### Latest
+	
+	```
+	.onBackpressureLatest()
+	```
+	
+	یعنی:
+	
+	> فقط جدیدترین داده را نگه دار.
+	
+	مثلاً برای:
+	
+	```
+	Temperature:
+	20.1
+	20.2
+	20.3
+	20.4
+	20.5
+	...
+	```
+	
+	اگر Consumer کند است، شاید لازم نباشد همه‌ی مقادیر را پردازش کند؛ آخرین مقدار مهم‌تر است.
+	
+	---
+	
+	# 7. نکته مهم مصاحبه: Backpressure فقط Buffer نیست
+	
+	این قسمت را حتماً در مصاحبه بگو.
+	
+	**Backpressure اساساً یک مکانیزم flow control است، نه صرفاً یک buffer.**
+	
+	در Reactive Streams مدل اصلی این است:
+	
+	```
+	Publisher
+	    |
+	    v
+	Subscriber
+	    |
+	    +---- request(n)
+	```
+	
+	Subscriber ظرفیت خودش را به upstream اعلام می‌کند.
+	
+	مثلاً:
+	
+	```
+	Subscriber:
+	request(100)
+	
+	        ↓
+	
+	Publisher:
+	send up to 100 items
+	
+	        ↓
+	
+	Subscriber:
+	processes them
+	
+	        ↓
+	
+	Subscriber:
+	request(100)
+	
+	        ↓
+	...
+	```
+	
+	`onBackpressureBuffer()` و `onBackpressureDrop()` بیشتر درباره این هستند که **وقتی upstream داده بیشتری از ظرفیت downstream تولید می‌کند، چه policyای داشته باشیم.**
+	
+	---
+	
+	# 8. یک مثال نزدیک به دنیای واقعی
+	
+	فرض کن یک سیستم Payment داریم:
+	
+	```
+	Kafka
+	  |
+	  v
+	Reactive Consumer
+	  |
+	  v
+	Payment Processing
+	  |
+	  v
+	Database
+	```
+	
+	فرض کنیم Kafka پیام‌ها را خیلی سریع می‌دهد:
+	
+	```
+	Kafka:             10,000 msg/sec
+	Database processing: 2,000 msg/sec
+	```
+	
+	اگر بدون کنترل همه چیز را وارد memory کنیم:
+	
+	```
+	Kafka
+	 |
+	 | 10,000/s
+	 v
+	+-------------------+
+	| Huge in-memory    |
+	| queue             |
+	+-------------------+
+	         |
+	         | 2,000/s
+	         v
+	      Database
+	```
+	
+	Backpressure کمک می‌کند downstream ظرفیت خودش را کنترل کند.
+	
+	مثلاً:
+	
+	```
+	Flux<Payment> payments = getPayments();
+	
+	payments
+	    .flatMap(
+	        this::processPayment,
+	        50        // concurrency
+	    )
+	    .subscribe();
+	```
+	
+	اینجا `concurrency = 50` یک ابزار مهم برای **محدود کردن تعداد پردازش‌های همزمان** است.
+	
+	یعنی به جای اینکه مثلاً 10,000 عملیات DB را همزمان راه بیندازیم، تعداد concurrent operations را محدود می‌کنیم.
+	
+	---
+	
+	# 9. یک تفاوت خیلی مهم
+	
+	در مصاحبه ممکن است interviewer بپرسد:
+	
+	> Is `flatMap` concurrency the same as backpressure?
+	
+	جواب:
+	
+	**نه، دقیقاً یکی نیستند.**
+	
+	Backpressure:
+	
+	```
+	How much data should flow downstream?
+	```
+	
+	Concurrency limit:
+	
+	```
+	How many asynchronous operations can run simultaneously?
+	```
+	
+	مثلاً:
+	
+	```
+	.flatMap(this::processPayment, 50)
+	```
+	
+	می‌گوید حداکثر حدود 50 inner publisher همزمان active باشند.
+	
+	اما Reactive Streams همچنان mechanism مربوط به demand (`request(n)`) را دارد.
+	
+	---
+	
+	# 10. جمله‌ای که برای مصاحبه پیشنهاد می‌کنم
+	
+	اگر interviewer پرسید:
+	
+	> **What is backpressure and how do you implement it in Reactor?**
+	
+	می‌توانی این‌طور جواب بدهی:
+	
+	> **Backpressure is a flow-control mechanism where the consumer can signal how much data it is ready to process, preventing a fast producer from overwhelming a slower consumer. In Project Reactor, this is based on the Reactive Streams specification, where demand is propagated using `Subscription.request(n)`.**
+	> 
+	> **In addition, Reactor provides operators such as `onBackpressureBuffer`, `onBackpressureDrop`, and `onBackpressureLatest` to define what should happen when the producer produces faster than the downstream can consume.**
+	> 
+	> **For example, for payment processing I might combine backpressure with bounded concurrency using `flatMap(..., concurrency)` to prevent too many concurrent database or external-service calls.**
+	
+	این جواب برای سطح **Senior Java / Backend** خیلی بهتر از این است که فقط بگویی:
+	
+	> "Backpressure prevents memory overflow."
+	
+	چون نشان می‌دهد تفاوت **Reactive Streams demand، overflow policy و concurrency control** را می‌دانی.
