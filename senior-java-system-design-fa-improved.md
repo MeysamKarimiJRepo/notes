@@ -191,8 +191,8 @@ Clients
 **سوال:** چطور service discovery و configuration management را مدیریت می‌کنید (Eureka، Consul، Spring Cloud Config)؟
 **پاسخ:** Service discovery (مثل Eureka یا Consul) به سرویس‌ها اجازه می‌دهد به‌صورت dynamic یکدیگر را در network پیدا کنند بدون hardcode کردن IP. Spring Cloud Config یک central configuration server فراهم می‌کند که تنظیمات را بدون نیاز به redeploy، به سرویس‌ها می‌دهد (با پشتیبانی از refresh dynamic).
 
-**سوال:** یک زنجیره فراخوانی microservice مقاوم با circuit breaker، retry و timeout طراحی کنید (Resilience4j / Hystrix).
-**پاسخ:** Circuit breaker وقتی نرخ خطای یک سرویس از یک threshold عبور کند، به‌صورت موقت فراخوانی‌ها را قطع می‌کند تا سرویس downstream فرصت بهبود پیدا کند (fail-fast). Retry با exponential backoff برای خطاهای گذرا استفاده می‌شود. Timeout جلوی block شدن نامحدود thread ها را می‌گیرد. در Java، Resilience4j این pattern ها را به‌صورت annotation-based یا functional فراهم می‌کند.
+**سوال:** یک زنجیره فراخوانی microservice مقاوم با circuit breaker، retry و timeout طراحی کنید (Resilience4j / Hystrix[^19]).
+**پاسخ:** Circuit breaker وقتی نرخ خطای یک سرویس از یک threshold عبور کند، به‌صورت موقت فراخوانی‌ها را قطع می‌کند تا سرویس downstream فرصت بهبود پیدا کند (fail-fast). Retry با exponential backoff برای خطاهای گذرا استفاده می‌شود. Timeout جلوی block شدن نامحدود thread ها را می‌گیرد. در Java، Resilience4j این pattern ها را به‌صورت annotation-based یا functional فراهم می‌کند.[^18]
 
 **سوال:** چطور یک راه‌حل distributed logging و tracing بین microservice ها طراحی می‌کنید (correlation ID، OpenTelemetry، Zipkin/Jaeger)؟
 **پاسخ:** یک correlation ID (trace ID) در ابتدای هر request تولید و در تمام header های بین‌سرویسی propagate می‌شود. OpenTelemetry SDK این trace ها را جمع‌آوری و به backend هایی مثل Jaeger یا Zipkin ارسال می‌کند تا کل مسیر یک request بین سرویس‌ها قابل visualize باشد. لاگ‌ها هم باید این correlation ID را شامل شوند تا در ELK قابل جستجو باشند.
@@ -8252,3 +8252,1605 @@ Trade-offها:
 	> "Backpressure prevents memory overflow."
 	
 	چون نشان می‌دهد تفاوت **Reactive Streams demand، overflow policy و concurrency control** را می‌دانی.
+
+[^18]: حتماً. این سؤال در مصاحبه‌های **Senior Java / Tech Lead / Solution Architect** خیلی مهم است، چون فقط تعریف Circuit Breaker کافی نیست؛ باید بتوانی نشان بدهی **چطور چند microservice را طوری به هم وصل می‌کنی که خرابی یک سرویس باعث از کار افتادن کل زنجیره نشود.**
+	
+	---
+	
+	# 1. اول مسئله را ببینیم
+	
+	فرض کن یک درخواست وارد سیستم پرداخت می‌شود:
+	
+	```
+	Client
+	  │
+	  ▼
+	┌─────────────┐
+	│ Order       │
+	│ Service     │
+	└──────┬──────┘
+	       │
+	       ▼
+	┌─────────────┐
+	│ Payment     │
+	│ Service     │
+	└──────┬──────┘
+	       │
+	       ▼
+	┌─────────────┐
+	│ Bank        │
+	│ Service     │
+	└─────────────┘
+	```
+	
+	حالا فرض کن `Bank Service` کند یا Down شود.
+	
+	اگر هیچ مکانیزم حفاظتی نداشته باشیم:
+	
+	```
+	1000 requests
+	      │
+	      ▼
+	 Payment Service
+	      │
+	      │ 1000 requests
+	      ▼
+	 Bank Service
+	      │
+	      X  DOWN
+	```
+	
+	هر request منتظر Bank Service می‌ماند.
+	
+	مثلاً:
+	
+	```
+	Request 1  ────────────────> timeout
+	Request 2  ────────────────> timeout
+	Request 3  ────────────────> timeout
+	...
+	Request 1000 ──────────────> timeout
+	```
+	
+	در نتیجه thread pool سرویس Payment هم پر می‌شود:
+	
+	```
+	Payment Service
+	┌──────────────────────────────┐
+	│ Thread 1  → waiting          │
+	│ Thread 2  → waiting          │
+	│ Thread 3  → waiting          │
+	│ Thread 4  → waiting          │
+	│ ...                          │
+	│ Thread 200 → waiting         │
+	└──────────────────────────────┘
+	             ↓
+	       Thread Pool Exhaustion
+	             ↓
+	       Payment Service DOWN
+	             ↓
+	         Order Service
+	             ↓
+	            DOWN
+	```
+	
+	این همان چیزی است که می‌خواهیم جلویش را بگیریم.
+	
+	---
+	
+	# 2. سه ابزار اصلی
+	
+	در این سؤال سه Pattern داریم:
+	
+	```
+	                Resilience
+	                   │
+	       ┌───────────┼───────────┐
+	       ▼           ▼           ▼
+	   Timeout       Retry     Circuit Breaker
+	```
+	
+	هرکدام مشکل متفاوتی را حل می‌کنند.
+	
+	|Pattern|مشکل اصلی|هدف|
+	|---|---|---|
+	|Timeout|سرویس بیش از حد منتظر می‌ماند|محدود کردن زمان انتظار|
+	|Retry|خطای موقتی|تلاش مجدد|
+	|Circuit Breaker|سرویس واقعاً خراب است|جلوگیری از ارسال درخواست بیشتر|
+	|Bulkhead|مصرف بیش از حد منابع|جداسازی منابع|
+	|Rate Limiter|ترافیک بیش از ظرفیت|محدود کردن نرخ درخواست|
+	
+	در مصاحبه اگر **Bulkhead** را هم کنار این سه مورد ذکر کنی، پاسخ معماری قوی‌تر می‌شود.
+	
+	---
+	
+	# 3. Timeout چیست؟
+	
+	فرض کنیم Payment → Bank داریم.
+	
+	بدون timeout:
+	
+	```
+	Payment
+	   │
+	   │ request
+	   ▼
+	 Bank
+	   │
+	   │ ......... 30 sec
+	   │ ......... 60 sec
+	   │ ......... 120 sec
+	   ▼
+	 ????
+	```
+	
+	Payment نمی‌داند چه زمانی باید دست از انتظار بکشد.
+	
+	با Timeout:
+	
+	```
+	Payment
+	   │
+	   │ request
+	   ▼
+	 Bank
+	   │
+	   │
+	   │  ........
+	   │
+	   X  2 seconds
+	```
+	
+	مثلاً:
+	
+	```
+	timeout = 2 seconds
+	```
+	
+	یعنی:
+	
+	> اگر Bank ظرف 2 ثانیه پاسخ نداد، این درخواست را fail کن.
+	
+	مثلاً:
+	
+	```
+	@TimeLimiter(name = "bankService")
+	public CompletableFuture<PaymentResponse> callBank() {
+	    return CompletableFuture.supplyAsync(
+	        () -> bankClient.pay()
+	    );
+	}
+	```
+	
+	نکته مهم برای مصاحبه:
+	
+	**Timeout جای Circuit Breaker را نمی‌گیرد.**
+	
+	Timeout می‌گوید:
+	
+	> این request بیش از حد طول کشید.
+	
+	Circuit Breaker می‌گوید:
+	
+	> تعداد زیادی request اخیر شکست خورده‌اند؛ فعلاً اصلاً request جدید ارسال نکن.
+	
+	---
+	
+	# 4. Retry چیست؟
+	
+	فرض کن Bank Service برای یک لحظه مشکل شبکه دارد:
+	
+	```
+	Request
+	   │
+	   ▼
+	 Bank
+	   X
+	  temporary failure
+	```
+	
+	ممکن است درخواست دوم موفق شود.
+	
+	پس:
+	
+	```
+	Attempt 1
+	    │
+	    X
+	
+	wait
+	
+	Attempt 2
+	    │
+	    X
+	
+	wait
+	
+	Attempt 3
+	    │
+	    ▼
+	  SUCCESS
+	```
+	
+	اما نباید این کار را انجام دهیم:
+	
+	```
+	fail
+	 │
+	 ├── retry immediately
+	 ├── retry immediately
+	 ├── retry immediately
+	 ├── retry immediately
+	 └── retry immediately
+	```
+	
+	چون اگر Bank تحت فشار باشد، Retry می‌تواند شرایط را **بدتر** کند.
+	
+	---
+	
+	# 5. Exponential Backoff
+	
+	بهتر است فاصله Retryها افزایش پیدا کند:
+	
+	```
+	Attempt 1
+	   X
+	   │
+	   │ 100 ms
+	   ▼
+	Attempt 2
+	   X
+	   │
+	   │ 200 ms
+	   ▼
+	Attempt 3
+	   X
+	   │
+	   │ 400 ms
+	   ▼
+	Attempt 4
+	   X
+	```
+	
+	فرمول ساده:
+	
+	```
+	delay = initialDelay × 2^attempt
+	```
+	
+	مثلاً:
+	
+	```
+	100ms
+	200ms
+	400ms
+	800ms
+	1600ms
+	```
+	
+	معمولاً **jitter** هم اضافه می‌کنیم تا هزاران client دقیقاً همزمان Retry نکنند:
+	
+	```
+	Client A → retry after 237ms
+	Client B → retry after 184ms
+	Client C → retry after 291ms
+	```
+	
+	این کار از **thundering herd** جلوگیری می‌کند.
+	
+	---
+	
+	# 6. اما Retry برای همه خطاها مناسب نیست
+	
+	این نکته برای مصاحبه خیلی مهم است.
+	
+	مثلاً:
+	
+	```
+	HTTP 500 / temporary network error
+	        ↓
+	       Retry
+	```
+	
+	ممکن است مناسب باشد.
+	
+	اما:
+	
+	```
+	HTTP 400 Bad Request
+	HTTP 401 Unauthorized
+	HTTP 403 Forbidden
+	Business validation error
+	```
+	
+	Retry معمولاً بی‌معنی است.
+	
+	همچنین در سیستم‌های پرداخت باید مراقب **duplicate operation** باشیم.
+	
+	مثلاً:
+	
+	```
+	Payment request
+	      │
+	      ▼
+	Bank
+	      │
+	      ├── payment SUCCESS
+	      │
+	      └── response lost
+	```
+	
+	Client فکر می‌کند:
+	
+	```
+	Payment FAILED
+	```
+	
+	و Retry می‌کند:
+	
+	```
+	Retry Payment
+	      │
+	      ▼
+	Bank
+	      │
+	      ▼
+	Second Payment
+	```
+	
+	ممکن است مشتری **دو بار شارژ شود**.
+	
+	بنابراین در سیستم‌های مالی Retry باید همراه با **idempotency key / idempotent operation** طراحی شود.
+	
+	این نکته برای تجربه‌ی fintech شما بسیار ارزشمند است.
+	
+	---
+	
+	# 7. Circuit Breaker چیست؟
+	
+	حالا فرض کنیم Bank واقعاً Down شده.
+	
+	اگر Retry داشته باشیم:
+	
+	```
+	Request
+	  │
+	  ├── attempt 1 → FAIL
+	  ├── attempt 2 → FAIL
+	  ├── attempt 3 → FAIL
+	  │
+	  ▼
+	 next request
+	  │
+	  ├── attempt 1 → FAIL
+	  ├── attempt 2 → FAIL
+	  └── attempt 3 → FAIL
+	```
+	
+	یعنی داریم یک سرویس خراب را با درخواست‌های بیشتر بمباران می‌کنیم!
+	
+	اینجاست که Circuit Breaker وارد می‌شود.
+	
+	---
+	
+	# 8. سه State اصلی Circuit Breaker
+	
+	```
+	              failures exceed threshold
+	                      │
+	                      ▼
+	              ┌──────────────┐
+	              │     OPEN     │
+	              └──────┬───────┘
+	                     │
+	              wait duration
+	                     │
+	                     ▼
+	              ┌──────────────┐
+	              │ HALF-OPEN    │
+	              └──────┬───────┘
+	                     │
+	             ┌───────┴────────┐
+	             │                │
+	          success           failure
+	             │                │
+	             ▼                ▼
+	          CLOSED            OPEN
+	```
+	
+	### CLOSED
+	
+	حالت عادی:
+	
+	```
+	Request
+	   │
+	   ▼
+	Circuit Breaker
+	   │
+	   ▼
+	Bank
+	```
+	
+	درخواست‌ها عبور می‌کنند.
+	
+	---
+	
+	### OPEN
+	
+	مثلاً داریم:
+	
+	```
+	last 100 calls
+	
+	70 failed
+	30 successful
+	```
+	
+	اگر threshold ما:
+	
+	```
+	failureRateThreshold = 50%
+	```
+	
+	باشد، Circuit باز می‌شود.
+	
+	حالا:
+	
+	```
+	Request
+	   │
+	   ▼
+	Circuit Breaker
+	   │
+	   X
+	   │
+	FAIL FAST
+	```
+	
+	اصلاً به Bank درخواست نمی‌فرستیم.
+	
+	این نکته مهم است:
+	
+	> **Open یعنی fail-fast.**
+	
+	---
+	
+	# 9. HALF-OPEN
+	
+	Circuit برای همیشه باز نمی‌ماند.
+	
+	مثلاً:
+	
+	```
+	waitDurationInOpenState = 10 seconds
+	```
+	
+	بعد از 10 ثانیه:
+	
+	```
+	OPEN
+	  │
+	  │ 10 sec
+	  ▼
+	HALF-OPEN
+	```
+	
+	در این حالت چند request آزمایشی اجازه عبور دارند:
+	
+	```
+	              HALF-OPEN
+	                  │
+	           ┌──────┼──────┐
+	           ▼      ▼      ▼
+	          test   test   test
+	           │      │      │
+	           ▼      ▼      ▼
+	         success success success
+	                  │
+	                  ▼
+	               CLOSED
+	```
+	
+	اگر دوباره fail شود:
+	
+	```
+	HALF-OPEN
+	    │
+	    X
+	    ▼
+	  OPEN
+	```
+	
+	---
+	
+	# 10. حالا زنجیره کامل را بسازیم
+	
+	معماری بهتر:
+	
+	```
+	                    ┌─────────────────────┐
+	                    │       Client        │
+	                    └──────────┬──────────┘
+	                               │
+	                               ▼
+	                    ┌─────────────────────┐
+	                    │   Order Service     │
+	                    └──────────┬──────────┘
+	                               │
+	                               ▼
+	                    ┌─────────────────────┐
+	                    │   Payment Service   │
+	                    │                     │
+	                    │  Circuit Breaker    │
+	                    │  Retry              │
+	                    │  Timeout            │
+	                    └──────────┬──────────┘
+	                               │
+	                               ▼
+	                    ┌─────────────────────┐
+	                    │    Bank Service     │
+	                    └─────────────────────┘
+	```
+	
+	ولی ترتیب اجرای این Patternها مهم است.
+	
+	---
+	
+	# 11. ترتیب پیشنهادی
+	
+	یک طراحی معمول می‌تواند چیزی شبیه این باشد:
+	
+	```
+	Payment Service
+	      │
+	      ▼
+	┌─────────────────┐
+	│ Circuit Breaker │
+	└────────┬────────┘
+	         │
+	         ▼
+	┌─────────────────┐
+	│     Retry       │
+	└────────┬────────┘
+	         │
+	         ▼
+	┌─────────────────┐
+	│    Timeout      │
+	└────────┬────────┘
+	         │
+	         ▼
+	   Bank Service
+	```
+	
+	اما یک نکته ظریف وجود دارد:
+	
+	**ترتیب دقیق decoration در Resilience4j باید آگاهانه انتخاب شود**، چون مشخص می‌کند Circuit Breaker شکست‌های Retry را چگونه می‌بیند و Timeout چه چیزی را اندازه می‌گیرد.
+	
+	برای یک مصاحبه، مهم‌تر از حفظ کردن ترتیب این است که بگویی:
+	
+	> I would explicitly define the decorator order based on whether I want the circuit breaker to count individual retry attempts or the final call outcome, and I would keep the overall latency budget bounded.
+	
+	این جواب خیلی Seniorتر است.
+	
+	---
+	
+	# 12. پیاده‌سازی با Resilience4j
+	
+	فرض کنیم Spring Boot داریم.
+	
+	Dependencyها:
+	
+	```
+	<dependency>
+	    <groupId>io.github.resilience4j</groupId>
+	    <artifactId>resilience4j-spring-boot3</artifactId>
+	</dependency>
+	```
+	
+	سپس:
+	
+	```
+	@Service
+	public class PaymentService {
+	
+	    private final BankClient bankClient;
+	
+	    public PaymentService(BankClient bankClient) {
+	        this.bankClient = bankClient;
+	    }
+	
+	    @CircuitBreaker(
+	        name = "bankService",
+	        fallbackMethod = "fallback"
+	    )
+	    @Retry(
+	        name = "bankService"
+	    )
+	    @TimeLimiter(
+	        name = "bankService"
+	    )
+	    public CompletableFuture<PaymentResponse> pay(
+	            PaymentRequest request) {
+	
+	        return CompletableFuture.supplyAsync(
+	            () -> bankClient.pay(request)
+	        );
+	    }
+	
+	    private CompletableFuture<PaymentResponse> fallback(
+	            PaymentRequest request,
+	            Throwable ex) {
+	
+	        return CompletableFuture.completedFuture(
+	            PaymentResponse.failed(
+	                "Payment service temporarily unavailable"
+	            )
+	        );
+	    }
+	}
+	```
+	
+	البته در پروژه واقعی بهتر است برای عملیات حساس پرداخت، fallback را با احتیاط طراحی کنیم؛ مثلاً **نباید صرفاً به خاطر timeout به کاربر بگوییم payment failed** اگر وضعیت واقعی تراکنش نامشخص است.
+	
+	---
+	
+	# 13. Configuration
+	
+	مثلاً:
+	
+	```
+	resilience4j:
+	
+	  circuitbreaker:
+	    instances:
+	      bankService:
+	        slidingWindowType: COUNT_BASED
+	        slidingWindowSize: 100
+	
+	        failureRateThreshold: 50
+	
+	        waitDurationInOpenState: 10s
+	
+	        permittedNumberOfCallsInHalfOpenState: 5
+	
+	        minimumNumberOfCalls: 20
+	
+	  retry:
+	    instances:
+	      bankService:
+	        maxAttempts: 3
+	
+	        waitDuration: 200ms
+	
+	        enableExponentialBackoff: true
+	
+	        exponentialBackoffMultiplier: 2
+	
+	  timelimiter:
+	    instances:
+	      bankService:
+	        timeoutDuration: 2s
+	```
+	
+	یعنی تقریباً:
+	
+	```
+	Circuit Breaker:
+	100 calls window
+	50% failure threshold
+	10 sec OPEN
+	5 test calls in HALF-OPEN
+	
+	Retry:
+	maximum 3 attempts
+	200ms
+	400ms
+	800ms
+	
+	Timeout:
+	2 seconds
+	```
+	
+	---
+	
+	# 14. یک سناریوی واقعی
+	
+	فرض کنیم:
+	
+	```
+	Payment → Bank
+	```
+	
+	و:
+	
+	```
+	Timeout = 2s
+	Retry = 3 attempts
+	Circuit threshold = 50%
+	```
+	
+	### حالت اول: خطای موقت
+	
+	```
+	Request
+	   │
+	   ▼
+	Attempt #1
+	   │
+	   X network error
+	   │
+	   │ 200ms
+	   ▼
+	Attempt #2
+	   │
+	   ▼
+	 SUCCESS
+	```
+	
+	کاربر موفق می‌شود.
+	
+	---
+	
+	### حالت دوم: Bank Down
+	
+	```
+	Request
+	   │
+	   ▼
+	Attempt #1
+	   X
+	   │
+	 200ms
+	   ▼
+	Attempt #2
+	   X
+	   │
+	 400ms
+	   ▼
+	Attempt #3
+	   X
+	   │
+	   ▼
+	FAIL
+	```
+	
+	چندین درخواست بعدی هم fail می‌شوند.
+	
+	Circuit Breaker متوجه می‌شود:
+	
+	```
+	Failure Rate > threshold
+	```
+	
+	و:
+	
+	```
+	CLOSED
+	   │
+	   ▼
+	 OPEN
+	```
+	
+	از این لحظه:
+	
+	```
+	Request 1 ──X
+	Request 2 ──X
+	Request 3 ──X
+	Request 4 ──X
+	```
+	
+	بدون اینکه اصلاً به Bank برسند.
+	
+	---
+	
+	# 15. چرا Circuit Breaker باعث نجات کل سیستم می‌شود؟
+	
+	بدون Circuit Breaker:
+	
+	```
+	1000 users
+	     │
+	     ▼
+	Payment
+	     │
+	     ├──────► Bank DOWN
+	     ├──────► Bank DOWN
+	     ├──────► Bank DOWN
+	     ├──────► Bank DOWN
+	     └──────► Bank DOWN
+	
+	       ↓
+	
+	Thread Pool Exhaustion
+	       ↓
+	Payment DOWN
+	       ↓
+	Order DOWN
+	```
+	
+	با Circuit Breaker:
+	
+	```
+	1000 users
+	     │
+	     ▼
+	Payment
+	     │
+	     ▼
+	Circuit Breaker
+	     │
+	     X
+	     │
+	  FAIL FAST
+	```
+	
+	در نتیجه:
+	
+	```
+	Bank DOWN
+	    │
+	    ▼
+	Circuit OPEN
+	    │
+	    ├── no network calls
+	    ├── no waiting
+	    ├── fewer threads blocked
+	    └── less pressure on Bank
+	```
+	
+	این مفهوم را معمولاً **Fault Isolation** یا بخشی از **Graceful Degradation** می‌دانیم.
+	
+	---
+	
+	# 16. یک نکته بسیار مهم: Timeout و Retry می‌توانند latency را منفجر کنند
+	
+	فرض کنیم:
+	
+	```
+	timeout = 2 sec
+	retry = 3 attempts
+	```
+	
+	ممکن است فکر کنیم حداکثر latency:
+	
+	```
+	2 sec
+	```
+	
+	است.
+	
+	ولی اگر هر attempt تا timeout منتظر بماند:
+	
+	```
+	Attempt 1 → 2 sec
+	Attempt 2 → 2 sec
+	Attempt 3 → 2 sec
+	```
+	
+	می‌شود:
+	
+	```
+	≈ 6 sec + backoff
+	```
+	
+	یعنی:
+	
+	```
+	Client
+	 │
+	 ├── 2s timeout
+	 │
+	 ├── 200ms
+	 │
+	 ├── 2s timeout
+	 │
+	 ├── 400ms
+	 │
+	 └── 2s timeout
+	          │
+	          ▼
+	       total ≈ 6.6s
+	```
+	
+	پس باید **latency budget** داشته باشیم.
+	
+	مثلاً:
+	
+	```
+	Client SLA = 3 seconds
+	
+	        │
+	        ▼
+	┌──────────────────────────┐
+	│ Payment total budget 3s  │
+	└──────────────────────────┘
+	          │
+	          ├── retry #1
+	          ├── retry #2
+	          └── retry #3
+	```
+	
+	نمی‌توانیم کورکورانه بگوییم:
+	
+	> timeout = 5 sec + retry × 3
+	
+	باید timeout و retry را بر اساس **SLA، downstream latency و business requirement** تنظیم کنیم.
+	
+	---
+	
+	# 17. Bulkhead هم خیلی مهم است
+	
+	فرض کن Payment Service این منابع را دارد:
+	
+	```
+	Thread Pool = 100
+	```
+	
+	اگر Bank خراب شود و همه threadها درگیر Bank شوند:
+	
+	```
+	100 threads
+	     │
+	     ▼
+	Bank calls
+	     X
+	```
+	
+	سرویس‌های دیگر هم آسیب می‌بینند.
+	
+	Bulkhead:
+	
+	```
+	Payment Service
+	┌──────────────────────────────┐
+	│                              │
+	│ Bank calls → 20 threads      │
+	│                              │
+	│ DB calls   → 30 threads      │
+	│                              │
+	│ Other work → 50 threads      │
+	│                              │
+	└──────────────────────────────┘
+	```
+	
+	پس خرابی Bank نمی‌تواند تمام منابع Payment را مصرف کند.
+	
+	در معماری production:
+	
+	```
+	Timeout
+	   +
+	Retry
+	   +
+	Circuit Breaker
+	   +
+	Bulkhead
+	```
+	
+	معمولاً ترکیب بسیار قوی‌تری است.
+	
+	---
+	
+	# 18. یک تصویر معماری کامل‌تر
+	
+	```
+	                         Client
+	                           │
+	                           ▼
+	                  ┌─────────────────┐
+	                  │  Order Service  │
+	                  └────────┬────────┘
+	                           │
+	                           ▼
+	                  ┌─────────────────┐
+	                  │ Payment Service │
+	                  └────────┬────────┘
+	                           │
+	                           ▼
+	                    ┌──────────────┐
+	                    │   Bulkhead   │
+	                    └──────┬───────┘
+	                           │
+	                           ▼
+	                  ┌─────────────────┐
+	                  │ Circuit Breaker │
+	                  └────────┬────────┘
+	                           │
+	                           ▼
+	                      ┌─────────┐
+	                      │  Retry  │
+	                      └────┬────┘
+	                           │
+	                           ▼
+	                      ┌─────────┐
+	                      │ Timeout │
+	                      └────┬────┘
+	                           │
+	                           ▼
+	                  ┌─────────────────┐
+	                  │   Bank Service  │
+	                  └─────────────────┘
+	```
+	
+	---
+	
+	# 19. Fallback چیست؟
+	
+	وقتی Circuit باز است، الزاماً نباید فقط:
+	
+	```
+	500 Internal Server Error
+	```
+	
+	برگردانیم.
+	
+	بسته به business می‌توانیم degradation داشته باشیم.
+	
+	مثلاً:
+	
+	```
+	Product Service
+	     │
+	     ▼
+	Recommendation Service
+	     X DOWN
+	     │
+	     ▼
+	return default recommendations
+	```
+	
+	یا:
+	
+	```
+	Payment
+	   │
+	   ▼
+	Bank DOWN
+	   │
+	   ▼
+	Create "PENDING" transaction
+	   │
+	   ▼
+	Process asynchronously later
+	```
+	
+	برای **پرداخت** این مدل خیلی بهتر از این است که بدون دانستن وضعیت واقعی تراکنش، آن را `FAILED` اعلام کنیم.
+	
+	---
+	
+	# 20. Hystrix یا Resilience4j؟
+	
+	در سؤال نوشته شده:
+	
+	> Resilience4j / Hystrix
+	
+	در مصاحبه بهتر است بگویی:
+	
+	**Hystrix قدیمی و deprecated شده و برای پروژه‌های جدید معمولاً Resilience4j انتخاب مناسب‌تری است.**
+	
+	مقایسه مفهومی:
+	
+	```
+	Hystrix
+	  │
+	  └── Netflix
+	      └── older Spring Cloud systems
+	
+	Resilience4j
+	  │
+	  ├── Circuit Breaker
+	  ├── Retry
+	  ├── Rate Limiter
+	  ├── Bulkhead
+	  └── Time Limiter
+	```
+	
+	Resilience4j سبک‌تر و modular است و با functional/decorator style و Spring Boot integration کار می‌کند.
+	
+	---
+	
+	# 21. Monitoring هم فراموش نشود
+	
+	یک Senior Engineer فقط Pattern را پیاده نمی‌کند؛ باید بتواند بفهمد آیا Pattern درست کار می‌کند یا نه.
+	
+	مثلاً با:
+	
+	```
+	Micrometer
+	Prometheus
+	Grafana
+	```
+	
+	می‌توانیم ببینیم:
+	
+	```
+	CircuitBreaker
+	├── state
+	├── failure rate
+	├── slow calls
+	├── rejected calls
+	└── not permitted calls
+	
+	Retry
+	├── retry count
+	└── retry success/failure
+	
+	Timeout
+	└── timeout count
+	```
+	
+	مثلاً داشبورد:
+	
+	```
+	Bank Service
+	
+	Failure Rate       ███████████████  68%
+	Slow Calls         ███████████      52%
+	Retry Rate         █████████████    61%
+	Circuit State      OPEN
+	```
+	
+	این اطلاعات برای **RCA و performance engineering** بسیار مهم هستند.
+	
+	---
+	
+	# 22. یک پاسخ خوب برای مصاحبه
+	
+	اگر مصاحبه‌کننده همین سؤال را پرسید، می‌توانی تقریباً این‌طور جواب بدهی:
+	
+	> I would protect each synchronous downstream call with a combination of timeout, retry and circuit breaker, and potentially bulkhead isolation.
+	> 
+	> The timeout establishes an upper bound for an individual call. Retry is used only for transient and retryable failures, preferably with exponential backoff and jitter. I would avoid retrying non-transient errors and make sure payment operations are idempotent.
+	> 
+	> The circuit breaker monitors failures or slow calls. When the configured threshold is exceeded, it moves to OPEN and fails fast instead of continuing to call the unhealthy downstream service. After a wait period, it moves to HALF-OPEN and allows a few probe requests. If the downstream service has recovered, it returns to CLOSED; otherwise it goes back to OPEN.
+	> 
+	> With Resilience4j in Spring Boot, I can configure CircuitBreaker, Retry and TimeLimiter declaratively or programmatically. I would also expose their metrics through Micrometer/Prometheus and monitor failure rate, slow calls, retries and circuit state.
+	> 
+	> Finally, I would design the retry and timeout values around an overall latency budget rather than configuring them independently.
+	
+	---
+	
+	## چیزی که واقعاً باید برای مصاحبه به خاطر بسپاری
+	
+	این نمودار را حفظ کن:
+	
+	```
+	                 DOWNSTREAM FAILURE
+	                         │
+	                         ▼
+	                  ┌────────────┐
+	                  │  TIMEOUT   │
+	                  │ "Too slow" │
+	                  └─────┬──────┘
+	                        │
+	                        ▼
+	                  ┌────────────┐
+	                  │   RETRY    │
+	                  │ "Transient │
+	                  │   error?"  │
+	                  └─────┬──────┘
+	                        │
+	                 repeated failures
+	                        │
+	                        ▼
+	                  ┌────────────┐
+	                  │  CIRCUIT   │
+	                  │  BREAKER   │
+	                  └─────┬──────┘
+	                        │
+	                        ▼
+	                     OPEN
+	                        │
+	                        │ fail-fast
+	                        ▼
+	                 protect the system
+	                        │
+	                        │ after wait
+	                        ▼
+	                   HALF-OPEN
+	                    /       \
+	                success     failure
+	                   │           │
+	                   ▼           ▼
+	                CLOSED       OPEN
+	```
+	
+	و چهار جمله کلیدی:
+	
+	**Timeout:**
+	
+	> Don't wait forever.
+	
+	**Retry:**
+	
+	> Recover from transient failures.
+	
+	**Circuit Breaker:**
+	
+	> Stop calling an unhealthy service.
+	
+	**Bulkhead:**
+	
+	> Don't let one failing dependency consume all resources.
+	
+	این چهار مفهوم را اگر با **مثال Payment/Bank + exponential backoff + idempotency + latency budget + monitoring** توضیح بدهی، پاسخ تو از یک جواب تئوری ساده به سطح **Senior/Lead Java Engineer** نزدیک می‌شود.
+
+[^19]: # Resilience4j با مثال و کد
+	
+	Resilience4j یک کتابخانهٔ سبک برای **Fault Tolerance** در جاوا است. هر ماژول آن یک **Decorator** است که دور فراخوانی یک سرویس (مثلاً یک REST call به سرویس دیگر) پیچیده می‌شود.
+	
+	سناریوی همهٔ مثال‌ها این است: سرویس `OrderService` برای پرداخت، `PaymentService` را صدا می‌زند و این سرویس ممکن است کند یا خراب باشد.
+	
+	---
+	
+	## ۰. راه‌اندازی (Spring Boot 3)
+	
+	```xml
+	<dependency>
+	    <groupId>io.github.resilience4j</groupId>
+	    <artifactId>resilience4j-spring-boot3</artifactId>
+	</dependency>
+	<!-- annotationها بدون AOP کار نمی‌کنند -->
+	<dependency>
+	    <groupId>org.springframework.boot</groupId>
+	    <artifactId>spring-boot-starter-aop</artifactId>
+	</dependency>
+	<dependency>
+	    <groupId>org.springframework.boot</groupId>
+	    <artifactId>spring-boot-starter-actuator</artifactId>
+	</dependency>
+	```
+	
+	---
+	
+	## ۱. Circuit Breaker (قطع‌کنندهٔ مدار)
+	
+	**مشکل:** وقتی سرویس پرداخت از کار افتاده، اگر همچنان به آن درخواست بفرستیم، threadها منتظر می‌مانند، منابع تمام می‌شوند و خرابی به سرویس‌های دیگر هم سرایت می‌کند (**Cascading Failure**).
+	
+	**راه‌حل:** اگر درصد خطاها از یک حد بالاتر رفت، مدار باز می‌شود و درخواست‌ها **بلافاصله** رد می‌شوند و دیگر به سرویس خراب نمی‌رسند.
+	
+	### سه حالت
+	
+	```
+	         نرخ خطا >= آستانه
+	 CLOSED ───────────────────► OPEN
+	   ▲                           │
+	   │ تست‌ها موفق               │ بعد از waitDurationInOpenState
+	   │                           ▼
+	   └──────────────────── HALF_OPEN
+	          تست‌ها ناموفق ──► دوباره OPEN
+	```
+	
+	|حالت|رفتار|
+	|---|---|
+	|**CLOSED**|همه‌چیز عادی است؛ درخواست‌ها عبور می‌کنند و نتیجه‌شان شمرده می‌شود|
+	|**OPEN**|درخواست‌ها فوراً با `CallNotPermittedException` رد می‌شوند|
+	|**HALF_OPEN**|چند درخواست آزمایشی عبور می‌کنند تا معلوم شود سرویس سالم شده یا نه|
+	
+	### تنظیمات
+	
+	```yaml
+	resilience4j:
+	  circuitbreaker:
+	    instances:
+	      paymentService:
+	        sliding-window-type: COUNT_BASED      # یا TIME_BASED
+	        sliding-window-size: 10               # بررسی ۱۰ درخواست آخر
+	        minimum-number-of-calls: 5            # قبل از ۵ درخواست تصمیمی گرفته نمی‌شود
+	        failure-rate-threshold: 50            # اگر ۵۰٪ یا بیشتر خطا بود → OPEN
+	        slow-call-duration-threshold: 2s      # درخواست بالای ۲ ثانیه «کند» حساب می‌شود
+	        slow-call-rate-threshold: 80          # اگر ۸۰٪ کند بودند → OPEN
+	        wait-duration-in-open-state: 10s      # ۱۰ ثانیه در OPEN می‌ماند
+	        permitted-number-of-calls-in-half-open-state: 3
+	        automatic-transition-from-open-to-half-open-enabled: true
+	        record-exceptions:
+	          - java.io.IOException
+	          - org.springframework.web.client.HttpServerErrorException
+	        ignore-exceptions:
+	          - com.example.BusinessValidationException   # خطای بیزینسی نباید مدار را باز کند
+	```
+	
+	### کد
+	
+	```java
+	@Service
+	@RequiredArgsConstructor
+	@Slf4j
+	public class PaymentClient {
+	
+	    private final RestClient restClient;
+	
+	    @CircuitBreaker(name = "paymentService", fallbackMethod = "paymentFallback")
+	    public PaymentResponse pay(PaymentRequest request) {
+	        return restClient.post()
+	                .uri("http://payment-service/api/payments")
+	                .body(request)
+	                .retrieve()
+	                .body(PaymentResponse.class);
+	    }
+	
+	    // امضا باید مثل متد اصلی باشد + یک پارامتر Throwable در انتها
+	    private PaymentResponse paymentFallback(PaymentRequest request, CallNotPermittedException ex) {
+	        log.warn("Circuit is OPEN, payment rejected fast");
+	        return PaymentResponse.pending(request.orderId()); // بعداً از صف پردازش می‌شود
+	    }
+	
+	    private PaymentResponse paymentFallback(PaymentRequest request, Throwable ex) {
+	        log.error("Payment failed: {}", ex.getMessage());
+	        return PaymentResponse.failed(request.orderId());
+	    }
+	}
+	```
+	
+	> 💡 اگر چند fallback داشته باشید، Resilience4j **مشخص‌ترین** نوع exception را انتخاب می‌کند.
+	
+	---
+	
+	## ۲. Retry (تلاش مجدد)
+	
+	**مشکل:** بعضی خطاها **گذرا (transient)** هستند، مثل قطعی لحظه‌ای شبکه، timeout یا خطای 503. اگر کمی صبر کنیم و دوباره امتحان کنیم، احتمالاً موفق می‌شویم.
+	
+	```yaml
+	resilience4j:
+	  retry:
+	    instances:
+	      paymentService:
+	        max-attempts: 3                    # شامل تلاش اول هم هست (۱ + ۲ تکرار)
+	        wait-duration: 500ms
+	        enable-exponential-backoff: true   # 500ms → 1s → 2s
+	        exponential-backoff-multiplier: 2
+	        enable-randomized-wait: true       # Jitter برای جلوگیری از Thundering Herd
+	        randomized-wait-factor: 0.5
+	        retry-exceptions:
+	          - java.io.IOException
+	          - java.util.concurrent.TimeoutException
+	        ignore-exceptions:
+	          - com.example.InsufficientBalanceException   # تکرارش فایده‌ای ندارد
+	```
+	
+	```java
+	@Retry(name = "paymentService", fallbackMethod = "retryFallback")
+	public PaymentResponse pay(PaymentRequest request) {
+	    log.info("Calling payment service...");
+	    return restClient.post()
+	            .uri("http://payment-service/api/payments")
+	            .header("Idempotency-Key", request.idempotencyKey())  // ⚠️ بسیار مهم
+	            .body(request)
+	            .retrieve()
+	            .body(PaymentResponse.class);
+	}
+	
+	private PaymentResponse retryFallback(PaymentRequest request, Throwable ex) {
+	    return PaymentResponse.failed(request.orderId());
+	}
+	```
+	
+	> ⚠️ **نکتهٔ مهم مصاحبه:** فقط عملیات **Idempotent** را retry کنید. اگر پرداخت انجام شده باشد ولی پاسخ در شبکه گم شود، retry بدون `Idempotency-Key` باعث **پرداخت دوباره** می‌شود.
+	
+	> ⚠️ Retry بدون backoff و jitter روی سرویسی که زیر فشار است، وضعیتش را بدتر می‌کند (**Retry Storm**).
+	
+	---
+	
+	## ۳. Rate Limiter (محدودکنندهٔ نرخ)
+	
+	**مشکل:** می‌خواهیم تعداد درخواست‌ها در واحد زمان محدود باشد. مثلاً API بیرونی (درگاه بانک) فقط ۱۰ درخواست در ثانیه قبول می‌کند، یا می‌خواهیم سرویس خودمان را در برابر ترافیک زیاد محافظت کنیم.
+	
+	```yaml
+	resilience4j:
+	  ratelimiter:
+	    instances:
+	      paymentService:
+	        limit-for-period: 10          # ۱۰ درخواست
+	        limit-refresh-period: 1s      # در هر ثانیه
+	        timeout-duration: 500ms       # اگر سهمیه تمام شد تا 500ms صبر کن، بعد رد کن
+	```
+	
+	```java
+	@RateLimiter(name = "paymentService", fallbackMethod = "rateLimitFallback")
+	public PaymentResponse pay(PaymentRequest request) {
+	    return callPaymentApi(request);
+	}
+	
+	private PaymentResponse rateLimitFallback(PaymentRequest request, RequestNotPermitted ex) {
+	    throw new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS, "Try again later");
+	}
+	```
+	
+	```
+	ثانیه ۱: [req1..req10] ✅  req11 → صبر 500ms → اگر سهمیه آزاد نشد ❌ RequestNotPermitted
+	ثانیه ۲: سهمیه دوباره ۱۰ می‌شود
+	```
+	
+	> 💡 Rate Limiter در Resilience4j **محلی (per-instance)** است. اگر ۵ instance داشته باشید، کل نرخ ۵۰ در ثانیه می‌شود. برای محدودیت **توزیع‌شده** باید از Redis یا API Gateway استفاده کنید.
+	
+	---
+	
+	## ۴. Bulkhead (دیوارهٔ جداکننده)
+	
+	**ایده:** از دیواره‌های کشتی گرفته شده است. اگر یک بخش آب بگیرد، کل کشتی غرق نمی‌شود.
+	
+	**مشکل:** اگر سرویس پرداخت کند شود و همهٔ ۲۰۰ thread تامکت منتظر آن بمانند، endpointهای دیگر (مثل جستجوی محصول) هم از کار می‌افتند.
+	
+	**راه‌حل:** تعداد فراخوانی‌های **هم‌زمان** به هر سرویس را محدود کنید.
+	
+	### نوع اول: Semaphore (پیش‌فرض)
+	
+	```yaml
+	resilience4j:
+	  bulkhead:
+	    instances:
+	      paymentService:
+	        max-concurrent-calls: 20     # حداکثر ۲۰ فراخوانی هم‌زمان
+	        max-wait-duration: 100ms     # صبر برای گرفتن جای خالی
+	```
+	
+	```java
+	@Bulkhead(name = "paymentService", fallbackMethod = "bulkheadFallback")
+	public PaymentResponse pay(PaymentRequest request) {
+	    return callPaymentApi(request);
+	}
+	
+	private PaymentResponse bulkheadFallback(PaymentRequest request, BulkheadFullException ex) {
+	    throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "System busy");
+	}
+	```
+	
+	### نوع دوم: ThreadPool
+	
+	```yaml
+	resilience4j:
+	  thread-pool-bulkhead:
+	    instances:
+	      paymentService:
+	        core-thread-pool-size: 5
+	        max-thread-pool-size: 10
+	        queue-capacity: 20
+	        keep-alive-duration: 20ms
+	```
+	
+	```java
+	// نوع THREADPOOL حتماً باید CompletableFuture برگرداند
+	@Bulkhead(name = "paymentService", type = Bulkhead.Type.THREADPOOL,
+	          fallbackMethod = "asyncFallback")
+	public CompletableFuture<PaymentResponse> payAsync(PaymentRequest request) {
+	    return CompletableFuture.completedFuture(callPaymentApi(request));
+	}
+	
+	private CompletableFuture<PaymentResponse> asyncFallback(PaymentRequest r, Throwable ex) {
+	    return CompletableFuture.completedFuture(PaymentResponse.failed(r.orderId()));
+	}
+	```
+	
+	||Semaphore|ThreadPool|
+	|---|---|---|
+	|اجرا|روی thread فراخواننده|روی thread pool جداگانه|
+	|سربار|کم|بیشتر (context switch)|
+	|ایزوله‌سازی|فقط تعداد را محدود می‌کند|ایزوله‌سازی کامل thread|
+	|نوع خروجی|هر نوعی|`CompletableFuture`|
+	|کاربرد|پیش‌فرض، و با Virtual Threads|وقتی ایزوله‌سازی کامل لازم است|
+	
+	---
+	
+	## ۵. Time Limiter (محدودکنندهٔ زمان)
+	
+	**مشکل:** فراخوانی‌ای که هیچ‌وقت تمام نمی‌شود، thread را برای همیشه نگه می‌دارد.
+	
+	**راه‌حل:** برای اجرای کار یک سقف زمانی تعیین کنید.
+	
+	```yaml
+	resilience4j:
+	  timelimiter:
+	    instances:
+	      paymentService:
+	        timeout-duration: 2s
+	        cancel-running-future: true
+	```
+	
+	```java
+	// TimeLimiter فقط روی CompletableFuture یا Mono/Flux کار می‌کند
+	@TimeLimiter(name = "paymentService", fallbackMethod = "timeoutFallback")
+	public CompletableFuture<PaymentResponse> payAsync(PaymentRequest request) {
+	    return CompletableFuture.supplyAsync(() -> callPaymentApi(request));
+	}
+	
+	private CompletableFuture<PaymentResponse> timeoutFallback(PaymentRequest r, TimeoutException ex) {
+	    log.warn("Payment timed out after 2s");
+	    return CompletableFuture.completedFuture(PaymentResponse.pending(r.orderId()));
+	}
+	```
+	
+	> 💡 برای فراخوانی‌های **sync**، معمولاً timeout خودِ HTTP client (connect timeout و read timeout) را تنظیم می‌کنند. TimeLimiter مخصوص کدهای **async** است.
+	
+	---
+	
+	## ۶. ترکیب همه با هم (حالت واقعی)
+	
+	```java
+	@Retry(name = "paymentService", fallbackMethod = "fallback")
+	@CircuitBreaker(name = "paymentService")
+	@RateLimiter(name = "paymentService")
+	@TimeLimiter(name = "paymentService")
+	@Bulkhead(name = "paymentService")
+	public CompletableFuture<PaymentResponse> pay(PaymentRequest request) {
+	    return CompletableFuture.supplyAsync(() -> callPaymentApi(request));
+	}
+	
+	private CompletableFuture<PaymentResponse> fallback(PaymentRequest r, Throwable ex) {
+	    return CompletableFuture.completedFuture(PaymentResponse.pending(r.orderId()));
+	}
+	```
+	
+	### ترتیب اجرای پیش‌فرض در Spring (از بیرون به داخل)
+	
+	```
+	Retry ( CircuitBreaker ( RateLimiter ( TimeLimiter ( Bulkhead ( تابع اصلی ) ) ) ) )
+	```
+	
+	- **Retry بیرونی‌ترین لایه است:** هر تلاش مجدد دوباره از CircuitBreaker عبور می‌کند. پس اگر مدار باز شود، retryها هم فوراً رد می‌شوند و به سرویس خراب فشار نمی‌آورند.
+	- اگر بخواهید ترتیب را تغییر دهید، از تنظیمات `circuit-breaker-aspect-order`، `retry-aspect-order` و مشابه آن‌ها استفاده کنید. عدد بزرگ‌تر یعنی اولویت بالاتر و لایهٔ بیرونی‌تر.
+	
+	---
+	
+	## ۷. استفاده بدون Spring (Core API)
+	
+	```java
+	CircuitBreaker cb = CircuitBreaker.of("payment", CircuitBreakerConfig.custom()
+	        .failureRateThreshold(50)
+	        .slidingWindowSize(10)
+	        .waitDurationInOpenState(Duration.ofSeconds(10))
+	        .build());
+	
+	Retry retry = Retry.of("payment", RetryConfig.custom()
+	        .maxAttempts(3)
+	        .intervalFunction(IntervalFunction.ofExponentialBackoff(500, 2))
+	        .build());
+	
+	RateLimiter rl = RateLimiter.of("payment", RateLimiterConfig.custom()
+	        .limitForPeriod(10)
+	        .limitRefreshPeriod(Duration.ofSeconds(1))
+	        .timeoutDuration(Duration.ofMillis(500))
+	        .build());
+	
+	Bulkhead bh = Bulkhead.of("payment", BulkheadConfig.custom()
+	        .maxConcurrentCalls(20)
+	        .build());
+	
+	Supplier<PaymentResponse> decorated = Decorators
+	        .ofSupplier(() -> paymentApi.pay(request))
+	        .withBulkhead(bh)
+	        .withRateLimiter(rl)
+	        .withCircuitBreaker(cb)
+	        .withRetry(retry)                  // آخرین with = بیرونی‌ترین لایه
+	        .withFallback(List.of(CallNotPermittedException.class, IOException.class),
+	                      ex -> PaymentResponse.pending(request.orderId()))
+	        .decorate();
+	
+	PaymentResponse response = decorated.get();
+	
+	// مشاهدهٔ رویدادها
+	cb.getEventPublisher()
+	  .onStateTransition(e -> log.info("CB state: {}", e.getStateTransition()));
+	```
+	
+	---
+	
+	## ۸. جمع‌بندی سریع (برای مصاحبه)
+	
+	|الگو|به چه سؤالی جواب می‌دهد؟|Exception|
+	|---|---|---|
+	|**Circuit Breaker**|«سرویس خراب است، دیگر صدایش نزن»|`CallNotPermittedException`|
+	|**Retry**|«خطای موقت بود، دوباره امتحان کن»|خطای اصلی بعد از آخرین تلاش|
+	|**Rate Limiter**|«در هر ثانیه حداکثر N درخواست»|`RequestNotPermitted`|
+	|**Bulkhead**|«حداکثر N درخواست **هم‌زمان**»|`BulkheadFullException`|
+	|**Time Limiter**|«بیشتر از T ثانیه منتظر نمان»|`TimeoutException`|
+	
+	**تفاوت Rate Limiter و Bulkhead (سؤال رایج):**
+	
+	- Rate Limiter تعداد درخواست‌ها را در **بازهٔ زمانی** محدود می‌کند (throughput).
+	- Bulkhead تعداد درخواست‌هایی را که **همین الان** در حال اجرا هستند محدود می‌کند (concurrency).
+	
+	**مانیتورینگ:** از طریق Actuator می‌توانید وضعیت را ببینید: `/actuator/circuitbreakers`، `/actuator/health` (با `register-health-indicator: true`) و metricهای Micrometer مثل `resilience4j_circuitbreaker_state`.
+	
+	اگر بخواهید، می‌توانم این توضیحات را به‌صورت یک فایل markdown به repo یادداشت‌هایتان اضافه کنم، مثلاً کنار `senior-java-system-design-fa-improved.md`.
