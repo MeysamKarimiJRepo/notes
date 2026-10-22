@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>آمادگی مصاحبه: سوالات فنی</title>
+<style>
+:root { color-scheme: light; }
+* { box-sizing: border-box; }
+body {
+  direction: rtl; text-align: right; background: #f3f5f8; color: #202938;
+  font-family: Tahoma, "Segoe UI", Arial, sans-serif; line-height: 2;
+  margin: 0; padding: 28px 16px;
+}
+main {
+  max-width: 980px; margin: 0 auto; background: white; padding: 42px 54px;
+  border-radius: 16px; box-shadow: 0 8px 32px rgba(20,35,60,.08);
+}
+h1 { color: #123b63; font-size: 2rem; border-bottom: 3px solid #d8e7f5; padding-bottom: 14px; }
+h2 { color: #174d78; margin-top: 2.4em; padding: 8px 12px; background: #eef5fb; border-right: 4px solid #367db3; border-radius: 5px; }
+h3 { color: #245f87; margin-top: 1.8em; }
+p, li { font-size: 1rem; }
+li { margin: .35em 0; padding-right: 3px; }
+ul, ol { padding-right: 1.8em; padding-left: 0; }
+strong { color: #142f49; }
+code, pre { direction: ltr; unicode-bidi: embed; text-align: left; font-family: Consolas, "Courier New", monospace; }
+code { background: #f0f3f6; padding: 2px 5px; border-radius: 4px; font-size: .92em; }
+pre { background: #172331; color: #f1f5f9; padding: 16px; border-radius: 9px; overflow-x: auto; }
+pre code { background: transparent; color: inherit; padding: 0; }
+blockquote { margin: 1.2em 0; padding: 12px 18px; border-right: 4px solid #8ab5d7; background: #f5f9fc; }
+table { width: 100%; border-collapse: collapse; margin: 1.2em 0; display: block; overflow-x: auto; }
+th, td { border: 1px solid #d8e0e8; padding: 9px 12px; text-align: right; vertical-align: top; }
+th { background: #eaf1f7; color: #163e60; }
+tr:nth-child(even) td { background: #fafbfd; }
+hr { border: 0; border-top: 1px solid #dce3ea; margin: 2em 0; }
+@media (max-width: 650px) { main { padding: 24px 18px; } body { padding: 10px; } h1 { font-size: 1.5rem; } }
+@media print { body { background: white; padding: 0; } main { box-shadow: none; max-width: none; padding: 0; } h2, h3 { break-after: avoid; } }
+</style>
+</head>
+<body><main><h1>آمادگی مصاحبه: سوالات فنی</h1>
+<p>Oct 22, 2026 · @Meysam</p>
+<h2>روش جواب دادن در ۱ تا ۲ دقیقه</h2>
+<p>هر جواب را با همین چهار قدم بگو تا نه پراکنده‌گویی کنی و نه ذهنت قفل شود.</p>
+<p>1. **تعریف** در یک جمله.</p>
+<p>2. **چطور کار می‌کند** در ۲ تا ۳ جمله.</p>
+<p>3. **Trade-off یا pitfall**: کجا خراب می‌شود و چه هزینه‌ای دارد.</p>
+<p>4. **مثال خودت**: یک مورد واقعی از Worldline، OCS یا Novin Kish.</p>
+<p>اگر جزئیاتی را نمی‌دانی، همان چیزی را که می‌دانی بگو و توضیح بده چطور بررسی‌اش می‌کنی. مصاحبه‌گر این را بیشتر از یک حدس ارزش‌گذاری می‌کند.</p>
+<h2>Databases</h2>
+<h3>Index (B-tree، composite، وقتی index استفاده نمی‌شود)</h3>
+<ul>
+<li>**B-tree:** یک درخت متوازن از کلیدهای مرتب. جستجو O(log n) است و چون leaf pageها به هم لینک شده‌اند، range scan و ORDER BY ارزان است. fan-out بالا باعث می‌شود درخت فقط ۳ تا ۴ سطح عمق داشته باشد، پس disk read کم است.</li>
+<li>**Composite index (a, b, c):** از چپ به راست کار می‌کند؛ قانون *leftmost prefix*. به `WHERE a = ?` و `WHERE a = ? AND b = ?` کمک می‌کند، ولی به `WHERE b = ?` به‌تنهایی نه. ستون‌های equality را اول بگذار و ستون range را آخر.</li>
+<li>**Covering index:** همه ستون‌هایی که query لازم دارد داخل index است، پس DB اصلاً سراغ جدول نمی‌رود (index-only scan؛ `INCLUDE` در PostgreSQL و SQL Server).</li>
+<li>**وقتی index استفاده نمی‌شود:**</li>
+</ul>
+<p>  - تابع یا محاسبه روی ستون: `WHERE UPPER(name) = &#x27;X&#x27;` (راه‌حل: function-based index)</p>
+<p>  - implicit type conversion، مثلاً مقایسه ستون VARCHAR با عدد</p>
+<p>  - wildcard در ابتدا: `LIKE &#x27;%abc&#x27;`</p>
+<p>  - selectivity پایین: query بخش بزرگی از ردیف‌ها را برمی‌گرداند، پس full scan ارزان‌تر است</p>
+<p>  - رد شدن از ستون اول composite index</p>
+<p>  - statistics قدیمی، یا جدول خیلی کوچک</p>
+<ul>
+<li>**هزینه:** هر index عملیات INSERT/UPDATE/DELETE را کندتر می‌کند و فضا می‌گیرد. index را برای query patternهای واقعی بساز، نه «محض احتیاط».</li>
+</ul>
+<p>**مثال خودت:** تحلیل performance و review اسکریپت‌های DB روی سیستم Card Issuing — خواندن execution plan، پیدا کردن full scan یا index گم‌شده/بلااستفاده، و تأیید با load test.</p>
+<h3>ACID</h3>
+<ul>
+<li>**Atomicity:** همه یا هیچ؛ در صورت خطا DB با استفاده از undo data همه چیز را rollback می‌کند.</li>
+<li>**Consistency:** constraintها (PK، FK، CHECK) بعد از commit همیشه برقرارند.</li>
+<li>**Isolation:** transactionهای هم‌زمان کار نیمه‌تمام همدیگر را نمی‌بینند.</li>
+<li>**Durability:** بعد از commit، داده از crash جان سالم به در می‌برد — write-ahead log (redo log) هنگام commit روی دیسک flush می‌شود.</li>
+</ul>
+<h3>Isolation levelها و anomalyها</h3>
+<p>| Level | Dirty read | Non-repeatable read | Phantom read |</p>
+<p>| --- | --- | --- | --- |</p>
+<p>| Read Uncommitted | ممکن | ممکن | ممکن |</p>
+<p>| Read Committed | جلوگیری | ممکن | ممکن |</p>
+<p>| Repeatable Read | جلوگیری | جلوگیری | ممکن (طبق SQL standard) |</p>
+<p>| Serializable | جلوگیری | جلوگیری | جلوگیری |</p>
+<ul>
+<li>**Dirty read:** تغییر commit‌نشده یک transaction دیگر را می‌خوانی.</li>
+<li>**Non-repeatable read:** یک ردیف را دو بار می‌خوانی و دو مقدار متفاوت می‌گیری.</li>
+<li>**Phantom:** یک range query بار دوم ردیف‌های جدید برمی‌گرداند.</li>
+<li>این دو را هم بلد باش: **lost update** (دو read-modify-write که یکی روی دیگری overwrite می‌کند) و **write skew** (دو transaction هر کدام یک قانون را چک می‌کنند و بعد هر دو write می‌کنند و قانون می‌شکند — مثلاً دو پزشک هم‌زمان از on-call خارج می‌شوند).</li>
+<li>**پیش‌فرض‌های واقعی:** PostgreSQL، Oracle و SQL Server پیش‌فرضشان Read Committed است؛ MySQL InnoDB پیش‌فرضش Repeatable Read است. Repeatable Read در PostgreSQL در واقع snapshot isolation است (phantom ندارد ولی write skew ممکن است)؛ Serializable آن از SSI استفاده می‌کند و transactionهای متعارض را abort می‌کند، پس اپلیکیشن باید retry کند.</li>
+</ul>
+<h3>MVCC</h3>
+<ul>
+<li>Multi-Version Concurrency Control: هر update به جای overwrite، یک **version جدید** از ردیف می‌نویسد. هر transaction یک snapshot سازگار می‌خواند.</li>
+<li>نتیجه: **readerها writerها را block نمی‌کنند و writerها هم readerها را.** ولی writerها روی یک ردیف همچنان همدیگر را block می‌کنند.</li>
+<li>**PostgreSQL:** versionهای قدیمی در خود جدول می‌مانند (`xmin`/`xmax`)؛ VACUUM آن‌ها را پاک می‌کند، پس transactionهای طولانی باعث bloat می‌شوند.</li>
+<li>**Oracle:** versionهای قدیمی از undo segmentها بازسازی می‌شوند؛ queryهای طولانی ممکن است با ORA-01555 «snapshot too old» fail شوند.</li>
+<li>**SQL Server:** به‌طور پیش‌فرض locking؛ versioning فقط با READ\_COMMITTED\_SNAPSHOT یا SNAPSHOT، و version store در tempdb است.</li>
+</ul>
+<h3>Locking</h3>
+<ul>
+<li>قفل **shared (read) در برابر exclusive (write)**، معمولاً در سطح ردیف. SQL Server ممکن است تعداد زیادی row lock را به table lock تبدیل کند (lock escalation).</li>
+<li>**Pessimistic:** `SELECT … FOR UPDATE` ردیف را تا commit قفل می‌کند. برای contention بالا مثل به‌روزرسانی موجودی حساب مناسب است.</li>
+<li>**Optimistic:** یک ستون version؛ `UPDATE … WHERE id = ? AND version = ?` و اگر ۰ ردیف آپدیت شد یعنی کس دیگری برنده شده، پس retry کن. در JPA: `@Version`. وقتی تداخل کم است مناسب است.</li>
+<li>**Deadlock:** DB چرخه را تشخیص می‌دهد و یکی از transactionها را kill می‌کند. برای جلوگیری، ردیف‌ها را همیشه با ترتیب ثابت قفل کن (مثلاً بر اساس account id) و transactionها را کوتاه نگه دار.</li>
+</ul>
+<h3>N+1 queries</h3>
+<ul>
+<li>ORM یک query برای لیست parentها اجرا می‌کند، بعد برای children هر parent یک query جداگانه (lazy): یعنی 1 + N رفت‌وبرگشت.</li>
+<li>**تشخیص:** SQL logging، Hibernate statistics، APM traceهایی که صدها query یکسان در هر request نشان می‌دهند.</li>
+<li>**راه‌حل:** `JOIN FETCH` یا `@EntityGraph`، batch fetching (`hibernate.default_batch_fetch_size`)، یا DTO projection با یک query. مراقب باش: JOIN FETCH روی collection همراه با pagination، صفحه‌بندی را در حافظه انجام می‌دهد.</li>
+</ul>
+<h2>Concurrency</h2>
+<h3>Race condition در برابر deadlock</h3>
+<ul>
+<li>**Race condition:** نتیجه به زمان‌بندی threadها بستگی دارد. مثال کلاسیک: `count++` شامل read، add و write است — دو thread هر دو 5 را می‌خوانند و هر دو 6 می‌نویسند. راه‌حل: عملیات را atomic کن (با lock یا کلاس atomic) یا shared mutable state را حذف کن.</li>
+<li>**Deadlock:** threadها تا ابد منتظر lockهای همدیگر می‌مانند. Thread A قفل 1 را دارد و قفل 2 را می‌خواهد؛ thread B قفل 2 را دارد و قفل 1 را می‌خواهد.</li>
+<li>**جلوگیری از deadlock:** lockها را همیشه با یک ترتیب سراسری ثابت بگیر، از `tryLock(timeout)` استفاده کن، و lockهای کمتری را برای زمان کوتاه‌تری نگه دار.</li>
+<li>**تشخیص:** یک thread dump (`jstack` یا `jcmd &lt;pid&gt; Thread.print`) پیام «Found one Java-level deadlock» را گزارش می‌دهد.</li>
+<li>مفاهیم مرتبط: **livelock** (threadها مدام به هم واکنش نشان می‌دهند ولی پیشرفتی نیست) و **starvation** (یک thread هیچ‌وقت به resource نمی‌رسد).</li>
+</ul>
+<h3>volatile در برابر atomics در برابر locks</h3>
+<p>| ابزار | Visibility | Atomic compound ops | کاربرد معمول |</p>
+<p>| --- | --- | --- | --- |</p>
+<p>| `volatile` | بله | خیر | stop flag، رفرنس config منتشرشده |</p>
+<p>| `AtomicInteger` / `AtomicReference` | بله | بله، یک متغیر (CAS) | counter، sequence number، آپدیت lock-free |</p>
+<p>| `synchronized` / `ReentrantLock` | بله | بله، هر بلوک کد | invariantهایی که چند فیلد را در بر می‌گیرند |</p>
+<ul>
+<li>`volatile` یک رابطه happens-before ایجاد می‌کند: writeها فوراً توسط threadهای دیگر دیده می‌شوند و reorder نمی‌شوند. ولی `x++` را **امن نمی‌کند**.</li>
+<li>Atomicها از compare-and-swap (CAS) استفاده می‌کنند: بدون blocking، و در صورت تداخل retry. در contention شدید، `LongAdder` برای counter از `AtomicLong` بهتر است.</li>
+<li>Lockها mutual exclusion می‌دهند. `ReentrantLock` امکانات tryLock، timeout، fairness و condition اضافه می‌کند؛ `ReadWriteLock` اجازه چند reader یا یک writer می‌دهد.</li>
+</ul>
+<h3>Thread pools</h3>
+<ul>
+<li>به جای ساختن یک thread برای هر task، مجموعه ثابتی از threadها دوباره استفاده می‌شوند؛ این کار concurrency و حافظه را محدود می‌کند.</li>
+<li>تنظیمات `ThreadPoolExecutor`: core size، max size، queue، rejection policy.</li>
+<li>**Sizing:** برای کار CPU-bound تقریباً برابر تعداد coreها. برای IO-bound تقریباً cores × (1 + wait time ÷ compute time).</li>
+<li>**Pitfallها:** `Executors.newFixedThreadPool` از یک queue نامحدود استفاده می‌کند — زیر بار رشد می‌کند تا OutOfMemory. از bounded queue همراه با rejection policy مثل `CallerRunsPolicy` برای backpressure استفاده کن. threadها را نام‌گذاری کن و poolها را همیشه shutdown کن.</li>
+</ul>
+<h3>CompletableFuture</h3>
+<ul>
+<li>مراحل async را بدون blocking ترکیب می‌کند: `supplyAsync` ← `thenApply` (transform) ← `thenCompose` (زنجیر کردن یک فراخوانی async دیگر) ← `thenCombine` / `allOf` (اجرای موازی و سپس join).</li>
+<li>خطاها: `exceptionally` یا `handle`. Timeout: `orTimeout` و `completeOnTimeout` (از Java 9 به بعد).</li>
+<li>**Pitfall:** بدون آرگومان executor، روی `ForkJoinPool.commonPool()` اجرا می‌شود که برای کار CPU اندازه‌گذاری شده. برای blocking IO همیشه executor خودت را بده.</li>
+<li>مثال: سرویس‌های card-status، limits و fraud-score را موازی صدا بزن و نتایج را ترکیب کن — latency برابر کندترین فراخوانی می‌شود، نه مجموع آن‌ها.</li>
+</ul>
+<h3>Virtual threads (Java 21)</h3>
+<ul>
+<li>threadهای سبکی که JVM مدیریتشان می‌کند و روی یک pool کوچک از carrier threadها (platform threads) mount می‌شوند. یک فراخوانی blocking IO، virtual thread را unmount می‌کند و carrier آزاد می‌شود.</li>
+<li>می‌توانی میلیون‌ها از آن‌ها اجرا کنی، پس کد ساده thread-per-request با blocking مثل کد async scale می‌شود.</li>
+<li>**مناسب برای** کار IO-bound: فراخوانی HTTP و DB. برای کار CPU-bound **سریع‌تر نیست**.</li>
+<li>**Pitfallها:** آن‌ها را pool نکن، برای هر task یکی بساز. دسترسی به resourceهای محدود (DB connection) را با `Semaphore` کنترل کن. قبل از Java 24، blocking داخل `synchronized` باعث pin شدن carrier می‌شود — `ReentrantLock` را ترجیح بده. در استفاده سنگین از `ThreadLocal` محتاط باش.</li>
+</ul>
+<p>**ارتباط با Rust:** Rust با traitهای `Send` و `Sync` جلوی data race را در زمان compile می‌گیرد — همان مشکلاتی که در Java با دقت و code review حل می‌کنی.</p>
+<h2>Distributed systems</h2>
+<h3>CAP و consistency modelها</h3>
+<ul>
+<li>**CAP:** وقتی network partition رخ می‌دهد، سیستم باید بین **Consistency** (رد کردن یا به تأخیر انداختن requestها) و **Availability** (جواب دادن، شاید با داده قدیمی) یکی را انتخاب کند. partition اجتناب‌ناپذیر است، پس انتخاب واقعی بین C و A *در زمان* partition است.</li>
+<li>**مثال‌های CP:** ZooKeeper، etcd، یک SQL database با single leader. **مثال‌های AP:** Cassandra، DynamoDB در حالت پیش‌فرض.</li>
+<li>**PACELC** اضافه می‌کند: Else، یعنی وقتی partition نیست، بین **Latency** و **Consistency** trade-off داری.</li>
+<li>**Consistency modelها، از قوی به ضعیف:**</li>
+</ul>
+<p>  - **Linearizable:** مثل یک نسخه واحد رفتار می‌کند؛ هر read آخرین write را می‌بیند.</p>
+<p>  - **Causal:** ترتیب علت و معلول حفظ می‌شود (جواب هیچ‌وقت قبل از سوال ظاهر نمی‌شود).</p>
+<p>  - **Read-your-writes:** همیشه آپدیت‌های خودت را می‌بینی.</p>
+<p>  - **Eventual:** اگر writeها متوقف شوند، replicaها در نهایت یکسان می‌شوند.</p>
+<ul>
+<li>**Quorum:** با N replica، اگر read quorum R + write quorum W &gt; N باشد، هر read با آخرین write هم‌پوشانی دارد.</li>
+<li>**زاویه payments:** موجودی حساب به strong consistency نیاز دارد؛ نمای تاریخچه تراکنش‌ها می‌تواند eventually consistent باشد.</li>
+</ul>
+<h3>Idempotency و retry</h3>
+<ul>
+<li>در شبکه، timeout یعنی **نتیجه نامعلوم** — ممکن است request موفق شده باشد. پس retry لازم است و فقط وقتی امن است که عملیات **idempotent** باشد (دو بار اجرا = یک بار اجرا).</li>
+<li>**Idempotency key:** کلاینت یک request id یکتا می‌فرستد؛ سرور آن را با نتیجه زیر یک unique constraint ذخیره می‌کند. request تکراری به جای شارژ دوباره کارت، نتیجه ذخیره‌شده را برمی‌گرداند.</li>
+<li>**قوانین retry:** فقط خطاهای transient را retry کن (timeout، 503)، هرگز validation error را. از exponential backoff **همراه با jitter**، حداکثر تعداد تلاش و یک deadline کلی استفاده کن.</li>
+<li>**محافظت از downstream:** وقتی یک سرویس down است، circuit breaker جلوی retry storm را می‌گیرد (مثلاً Resilience4j).</li>
+</ul>
+<h3>At-least-once در برابر exactly-once (Kafka)</h3>
+<p>| Semantics | روش | ریسک |</p>
+<p>| --- | --- | --- |</p>
+<p>| At-most-once | اول commit offset، بعد process | در crash پیام از دست می‌رود |</p>
+<p>| At-least-once | اول process، بعد commit offset | در crash پیام تکراری ← consumer باید idempotent باشد |</p>
+<p>| Exactly-once | idempotent producer + transactions | فقط داخل Kafka؛ side effectهای بیرونی همچنان idempotency می‌خواهند |</p>
+<ul>
+<li>**Idempotent producer** (`enable.idempotence=true`، پیش‌فرض از Kafka 3.0): broker با producer id + sequence number، retryهای تکراری را دور می‌ریزد.</li>
+<li>**Transactions** (`transactional.id`): consume، process و produce به‌همراه commit offset، همه در یک قدم atomic. consumerها از `isolation.level=read_committed` استفاده می‌کنند.</li>
+<li>**جواب صادقانه:** exactly-once سرتاسری با یک database یا API بیرونی = at-least-once delivery + idempotent processing (جدول dedupe، upsert).</li>
+<li>**Transactional outbox:** ردیف business و یک ردیف outbox را در یک DB transaction بنویس؛ یک relay (یا Debezium CDC) آن را به Kafka publish می‌کند. این از حالت «در DB ذخیره شد ولی event گم شد» جلوگیری می‌کند.</li>
+</ul>
+<h3>Partitioning</h3>
+<ul>
+<li>داده را بر اساس key بین nodeها تقسیم کن تا سیستم scale out شود. **Hash partitioning** بار را یکنواخت پخش می‌کند؛ **range partitioning** رنج‌ها را کنار هم نگه می‌دارد و برای range query خوب است، ولی ریسک hot spot دارد.</li>
+<li>**Consistent hashing:** با اضافه یا حذف یک node، فقط حدود 1/N از keyها جابه‌جا می‌شوند.</li>
+<li>**Kafka:** ترتیب فقط **داخل یک partition** تضمین می‌شود؛ message key تعیین می‌کند پیام به کدام partition برود. بر اساس card یا account id کلید بزن تا همه eventهای یک کارت مرتب بمانند. در یک consumer group هر partition حداکثر به یک consumer می‌رسد، پس تعداد partitionها سقف parallelism است.</li>
+<li>**Pitfallها:** hot key (یک merchant خیلی بزرگ)، توقف‌های rebalancing، و query یا transactionهای cross-partition.</li>
+</ul>
+<h3>Leader election و consensus</h3>
+<ul>
+<li>**Consensus:** nodeها با وجود failure روی یک مقدار یا یک log مرتب به توافق می‌رسند. Raft و Paxos الگوریتم‌های اصلی‌اند؛ توضیح Raft راحت‌تر است.</li>
+<li>**Raft به‌طور خلاصه:**</li>
+</ul>
+<p>  1. زمان به **term**ها تقسیم می‌شود. followerی که heartbeat نمی‌شنود candidate می‌شود و رأی می‌خواهد.</p>
+<p>  2. candidateی که رأی **majority** را بگیرد، leader آن term می‌شود.</p>
+<p>  3. leader دستورات کلاینت را به log خودش اضافه و replicate می‌کند؛ یک entry وقتی **committed** است که majority آن را ذخیره کرده باشد.</p>
+<p>  4. nodeی با log قدیمی نمی‌تواند election را ببرد، پس داده committed هرگز گم نمی‌شود.</p>
+<ul>
+<li>**Majority quorum:** با 2f + 1 node می‌توان f failure را تحمل کرد (3 node ← 1 failure، 5 ← 2). برای همین clusterها تعداد فرد دارند.</li>
+<li>**Split brain:** با نیاز به majority جلوگیری می‌شود، به‌علاوه **fencing token** / epoch number تا writeهای leader قدیمی رد شوند.</li>
+<li>**کجا با آن روبه‌رو می‌شوی:** etcd (Kubernetes)، ZooKeeper (ZAB)، Kafka KRaft controllerها.</li>
+</ul>
+<h2>Data structures</h2>
+<h3>خلاصه Big-O (Java)</h3>
+<p>| Structure | Get / search | Insert | Delete | مرتب؟ | کی استفاده کنیم |</p>
+<p>| --- | --- | --- | --- | --- | --- |</p>
+<p>| `ArrayList` | O(1) با index، O(n) جستجو | O(1) amortized در انتها | O(n) | ترتیب درج | لیست پیش‌فرض، دسترسی سریع با index |</p>
+<p>| `LinkedList` / `ArrayDeque` | O(n) | O(1) در دو سر | O(1) در دو سر | ترتیب درج | queue یا stack (`ArrayDeque` بهتر است) |</p>
+<p>| `HashMap` / `HashSet` | O(1) میانگین | O(1) میانگین | O(1) میانگین | خیر | جستجوی سریع با key، حذف تکراری، شمارش |</p>
+<p>| `TreeMap` / `TreeSet` | O(log n) | O(log n) | O(log n) | مرتب | keyهای مرتب، range query یا nearest key |</p>
+<p>| `PriorityQueue` (heap) | O(1) peek min | O(log n) | O(log n) poll | فقط min/max | top-K، scheduling، کوچک‌ترین بعدی |</p>
+<p>| `LinkedHashMap` | O(1) | O(1) | O(1) | ترتیب درج یا دسترسی | LRU cache |</p>
+<p>برای ساختارهای hash بگو «میانگین»: وقتی تعداد زیادی key با هم collision دارند، worst case بدتر می‌شود.</p>
+<h3>ساختار داخلی HashMap</h3>
+<p>1. یک آرایه از **bucket**ها. تابع `hash()` بیت‌های بالای `hashCode()` را با بیت‌های پایین ترکیب می‌کند؛ index = `hash &amp; (capacity − 1)` (capacity توانی از 2 است).</p>
+<p>2. **Collision:** هر bucket یک linked list دارد. از Java 8، bucketی با بیش از 8 entry (و capacity جدول ≥ 64) به **red-black tree** تبدیل می‌شود، پس worst case به جای O(n)، برابر O(log n) است.</p>
+<p>3. **Resize:** وقتی size &gt; capacity × load factor (پیش‌فرض 0.75) شود، جدول دو برابر می‌شود و entryها دوباره پخش می‌شوند.</p>
+<p>4. **Contract:** objectهای equal باید `hashCode()` برابر داشته باشند. هیچ‌وقت key را بعد از درج تغییر نده — در bucket اشتباه گم می‌شود.</p>
+<p>5. **Thread-safe نیست.** از `ConcurrentHashMap` استفاده کن: CAS برای binهای خالی، lock برای هر bin، بدون lock سراسری؛ `compute` / `merge` برای آپدیت atomic.</p>
+<h3>Heap</h3>
+<ul>
+<li>یک complete binary tree که در آرایه ذخیره شده: فرزندان index i در 2i+1 و 2i+2 هستند. در min-heap هر parent ≤ فرزندانش است.</li>
+<li>peek برابر O(1)، insert و poll برابر O(log n)، ساختن از n آیتم O(n).</li>
+<li>`PriorityQueue` در Java یک min-heap است؛ برای max-heap از `Comparator.reverseOrder()` استفاده کن.</li>
+<li>**کاربردهای کلاسیک:** top-K آیتم (یک min-heap با اندازه K نگه دار ← O(n log K))، merge کردن K لیست مرتب، task scheduling بر اساس زمان، الگوریتم Dijkstra.</li>
+</ul>
+<h3>Treeها</h3>
+<ul>
+<li>**Binary search tree:** left &lt; node &lt; right. اگر نامتوازن باشد به O(n) می‌رسد؛ اگر متوازن باشد (red-black، AVL) در O(log n) می‌ماند. `TreeMap` یک red-black tree است، با `floorKey`، `ceilingKey` و `subMap` برای range query.</li>
+<li>**B-tree / B+ tree:** هر node کلیدهای زیادی دارد، پس درخت کم‌عمق است — برای disk page طراحی شده. به همین دلیل database indexها از آن استفاده می‌کنند (لینک به بخش Databases).</li>
+<li>**Trie:** درختی از کاراکترها، برای prefix search و autocomplete.</li>
+</ul>
+<h3>انتخاب — یک قانون کوتاه برای گفتن</h3>
+<p>«جستجو با key لازم داری ← HashMap. مرتب یا بر اساس range ← TreeMap. مدام کوچک‌ترین یا بزرگ‌ترین را می‌خواهی ← heap. دسترسی با index ← ArrayList. FIFO ← ArrayDeque.»</p>
+<h2>آشنایی با Rust</h2>
+<h3>Ownership</h3>
+<ul>
+<li>هر value دقیقاً **یک owner** دارد. وقتی owner از scope خارج شود، value اصطلاحاً drop و حافظه‌اش آزاد می‌شود — در نقطه‌ای مشخص که در زمان compile تعیین شده (مثل RAII در C++).</li>
+<li>assign یا پاس دادن یک value روی heap، ownership را **move** می‌کند: بعد از `let b = a;` دیگر نمی‌توان از `a` استفاده کرد. برای کپی صریح از `.clone()` استفاده کن.</li>
+</ul>
+<h3>Borrowing</h3>
+<ul>
+<li>به جای move، یک reference قرض می‌دهی: **چند `&amp;T` (shared و فقط خواندنی) یا یک `&amp;mut T` (انحصاری و قابل نوشتن) — هرگز هر دو با هم.**</li>
+<li>**Borrow checker** این را در زمان compile اجبار می‌کند. **Lifetime**ها تضمین می‌کنند یک reference هیچ‌وقت بیشتر از داده‌ای که به آن اشاره می‌کند عمر نکند.</li>
+<li>همین یک قانون data race را حذف می‌کند: دو thread نمی‌توانند هم‌زمان reference قابل نوشتن داشته باشند.</li>
+</ul>
+<h3>چرا memory safety بدون GC</h3>
+<ul>
+<li>Java در runtime با garbage collector زباله‌ها را پیدا می‌کند. Rust در زمان compile ثابت می‌کند حافظه کی آزاد می‌شود، پس GC pause نداریم و مصرف حافظه قابل پیش‌بینی است.</li>
+<li>compiler جلوی use-after-free، double free، dangling pointer و data race را می‌گیرد. null وجود ندارد: `Option&lt;T&gt;`. خطاها value هستند: `Result&lt;T, E&gt;` همراه با عملگر `?`.</li>
+<li>**Shared ownership در صورت نیاز:** `Rc&lt;T&gt;` (یک thread)، `Arc&lt;T&gt;` (چند thread). **Shared mutation:** `Mutex&lt;T&gt;` / `RwLock&lt;T&gt;` — lock *داده را در بر می‌گیرد*، پس بدون قفل کردن نمی‌توانی به داده دست بزنی (در Java، lock و داده جدا هستند و باید یادت بماند).</li>
+<li>traitهای `Send` / `Sync` مشخص می‌کنند چه چیزی می‌تواند بین threadها منتقل یا share شود؛ compiler آن‌ها را چک می‌کند.</li>
+<li>Async در Rust: `async`/`await` روی یک runtime مثل Tokio — قابل مقایسه با CompletableFuture و virtual threads.</li>
+</ul>
+<h3>«چرا به یک نقش Rust علاقه داری؟» — جواب تو</h3>
+<p>این جواب را عیناً به انگلیسی بگو، چون در مصاحبه همین را می‌گویی:</p>
+<p>&gt; &quot;I&#x27;ve built Java systems professionally for over 13 years, mostly high-throughput banking and card-processing services where performance, concurrency and correctness matter. A lot of my work has been finding latency, memory and concurrency problems in production. Rust appeals to me because it prevents many of those problems at compile time — no data races, no GC pauses, predictable performance. The concepts transfer directly from my experience: ownership is close to how I already reason about thread safety and resource lifetimes. I&#x27;m actively learning Rust, and for the coding exercise today I&#x27;ll use Java so you can see my problem solving at full speed.&quot;</p>
+<p>**اگر روی عمق دانش Rust فشار آوردند:** صادق باش و بگو: &quot;I&#x27;m not yet at production level in Rust. I&#x27;m comfortable with ownership, borrowing, Result/Option and the basic concurrency types, and I learn fast — I&#x27;ve moved between Java, C# and Angular/TypeScript in production before.&quot;</p></main></body>
+</html>
